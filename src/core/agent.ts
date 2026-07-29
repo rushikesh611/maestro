@@ -1,0 +1,172 @@
+import { randomUUID } from 'crypto';
+import type { AgentState, Message, Context, Skill, Memory, LLM, Tool } from './types';
+
+export function createAgentState(cfg: {
+    id?: string;
+    name: string;
+    systemPrompt: string;
+    tools: Tool[];
+    llm: LLM;
+    memory: Memory;
+    skills?: Skill[];
+    maxIterations?: number;
+    workingDir?: string;
+    parentId?: string;
+    onApprove?: AgentState['onApprove'];
+}): AgentState {
+    return {
+        id: cfg.id || randomUUID(),
+        name: cfg.name,
+        systemPrompt: cfg.systemPrompt,
+        messages: [],
+        tools: new Map(cfg.tools.map(t => [t.name, t])),
+        skills: cfg.skills ?? [],
+        llm: cfg.llm,
+        memory: cfg.memory,
+        workingDir: cfg.workingDir ?? process.cwd(),
+        maxIterations: cfg.maxIterations ?? 30,
+        iteration: 0,
+        parentId: cfg.parentId,
+        onApprove: cfg.onApprove,
+    };
+}
+
+function buildSystemPrompt(state: AgentState, learnings: string[], recent: string[], context: string[]): string {
+    let prompt = state.systemPrompt;
+    prompt += `\n\n## Operational Directive\nYou MUST begin every task by using the \`think\` tool to create a numbered plan. Label each step: [READ] for safe observation, [INVESTIGATE] for deep analysis, [MUTATE] for state-changing actions. Present your full plan before executing any other tool.`;
+
+    if (state.skills.length) {
+        prompt += `\n\n## Skills Library\nUse these domain skills to guide your investigation:\n`;
+        for (const skill of state.skills) {
+            prompt += `\n### ${skill.name}\n${skill.description}\n${skill.content}\n`;
+        }
+    }
+
+    if (recent.length) {
+        prompt += `\n\n## Recent Conversation (last ${recent.length} turns)\n${recent.join('\n')}`;
+    }
+
+    if (context.length) {
+        prompt += `\n\n## Relevant Memory\n${context.join('\n')}`;
+    }
+
+    if (learnings.length) {
+        prompt += `\n\n## Past Learnings\n${learnings.map(l => `- ${l}`).join('\n')}`;
+    }
+
+    return prompt;
+}
+
+
+export async function runAgent(state: AgentState, task: string): Promise<{ result: string; state: AgentState }> {
+    // Fetch memory in parallel
+    const [learnings, recentEntries, context] = await Promise.all([
+        state.memory.getLearnings(state.id, task),
+        state.memory.getRecent(state.id, 'conversation', 4),
+        state.memory.getRelevantContext(state.id, task, 5),
+    ]);
+
+    // Reverse to get chronological order (getRecent returns newest first)
+    const recent = recentEntries.reverse().map(r => r.content.slice(0, 800));
+
+    const system = buildSystemPrompt(state, learnings, recent, context);
+
+    let messages: Message[] = [
+        { role: 'system', content: system },
+        { role: 'user', content: task },
+    ];
+
+    await state.memory.add({
+        agent_id: state.id,
+        type: 'conversation',
+        content: `User: ${task}`,
+    });
+
+    for (let i = 0; i < state.maxIterations; i++) {
+        state = { ...state, iteration: i, messages };
+
+        const reply = await state.llm.chat(messages, Array.from(state.tools.values()));
+
+        if (!reply.tool_calls) {
+            const finalContent = reply.content ?? '(no response)';
+            messages = [...messages, { role: 'assistant', content: finalContent }];
+            await state.memory.add({
+              agent_id: state.id,
+              type: 'conversation',
+              content: `Assistant: ${finalContent}`,
+            });
+            // Don't await — let the user see the result immediately
+            reflect(state, task, finalContent).catch(() => {});
+            return { result: finalContent, state: { ...state, messages } };
+          }
+
+        messages = [...messages, {
+            role: 'assistant',
+            content: reply.content ?? '',
+            tool_calls: reply.tool_calls,
+        }];
+
+        for (const call of reply.tool_calls) {
+            const tool = state.tools.get(call.function.name);
+            let result: string;
+
+            try {
+                const args = JSON.parse(call.function.arguments);
+
+                if (tool && tool.risk !== 'read' && state.onApprove) {
+                    const approved = await state.onApprove(tool.name, args, tool.risk);
+                    if (!approved) {
+                        result = `User denied approval for ${tool.name}.`;
+                        messages = [...messages, { role: 'tool', content: result, tool_call_id: call.id }];
+                        continue;
+                    }
+                }
+
+                const ctx: Context = {
+                    agentId: state.id,
+                    parentId: state.parentId,
+                    memory: state.memory,
+                    llm: state.llm,
+                    workingDir: state.workingDir,
+                    skills: state.skills,
+                    onApprove: state.onApprove,
+                };
+
+                result = tool
+                    ? await tool.handler(args, ctx)
+                    : `Tool not found: ${call.function.name}`;
+            } catch (err: any) {
+                result = `Error: ${err.message}`;
+            }
+
+            messages = [...messages, { role: 'tool', content: result, tool_call_id: call.id }];
+            await state.memory.add({
+                agent_id: state.id,
+                type: 'conversation',
+                content: `Tool ${call.function.name}: ${result.slice(0, 2000)}`,
+            });
+        }
+    }
+
+    return { result: 'Max iterations reached.', state: { ...state, messages } };
+}
+
+async function reflect(state: AgentState, task: string, result: string): Promise<void> {
+    const prompt = `Task: ${task}\nResult: ${result}\n\nExtract 1-3 concise operational learnings (debug patterns, fixes, or investigation shortcuts) for similar future tasks. Reply NONE if nothing novel.`;
+    try {
+        const res = await state.llm.chat([
+            { role: 'system', content: 'You extract SRE operational learnings.' },
+            { role: 'user', content: prompt },
+        ]);
+        if (res.content && res.content !== 'NONE') {
+            await state.memory.add({
+                agent_id: state.id,
+                type: 'learning',
+                content: res.content,
+                metadata: JSON.stringify({ task: task.slice(0, 200) }),
+            });
+        }
+    } catch {
+        // Best-effort
+    }
+}

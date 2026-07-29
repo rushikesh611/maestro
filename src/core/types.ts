@@ -39,24 +39,27 @@ export interface AgentDef {
 
 export interface Context {
     agentId: string;
-    parentId: string;
+    parentId?: string;
     memory: Memory;
     llm: LLM;
     workingDir: string;
     skills: Skill[];
+    onApprove?: (tool: string, args: any, risk: string) => Promise<boolean>;
 }
 
-export interface AgentConfig {
-    id?: string;
+export interface AgentState {
+    id: string;
     name: string;
     systemPrompt: string;
-    tools: Tool[];
+    messages: Message[];
+    tools: Map<string, Tool>;
+    skills: Skill[];
     llm: LLM;
     memory: Memory;
-    skills?: Skill[];
-    maxIterations?: number;
+    workingDir: string;
+    maxIterations: number;
+    iteration: number;
     parentId?: string;
-    workingDir?: string;
     onApprove?: (tool: string, args: any, risk: string) => Promise<boolean>;
 }
 
@@ -83,7 +86,8 @@ export interface Memory {
     search(agentId: string, query: string, type?: string, limit?: number): Promise<MemoryEntry[]>;
     getRecent(agentId: string, type?: string, limit?: number): Promise<MemoryEntry[]>;
     getLearnings(agentId: string, query: string): Promise<string[]>;
-}
+    getRelevantContext(agentId: string, query: string, limit?: number): Promise<string[]>; // NEW
+  }
 
 export interface MemoryEntry {
     id: string;
