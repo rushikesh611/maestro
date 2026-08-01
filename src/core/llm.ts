@@ -40,9 +40,18 @@ export function createLLM(config: LLMConfig): import('./types').LLM {
       if (config.siteUrl) headers['HTTP-Referer'] = config.siteUrl;
       if (config.siteName) headers['X-Title'] = config.siteName;
 
+      // Mark system messages with cache_control so providers (Anthropic, OpenRouter)
+      // can serve them from cache on subsequent turns — reduces cost by up to 80%.
+      const cachedMessages = messages.map(m => {
+        if (m.role === 'system') {
+          return { ...m, cache_control: { type: 'ephemeral' as const } };
+        }
+        return m;
+      });
+
       const body = JSON.stringify({
         model: config.model,
-        messages,
+        messages: cachedMessages,
         temperature: 0.2,
         tools: toolDefs,
       });

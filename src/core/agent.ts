@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto';
 import type { AgentState, Message, Context, Skill, Memory, LLM, Tool } from './types';
 import { truncateOutput } from '../tools/truncator';
 import { selectRelevantSkills } from './skill-rag';
+import { applyContextWindow } from './context-window';
 
 export function createAgentState(cfg: {
     id?: string;
@@ -88,6 +89,8 @@ export async function runAgent(state: AgentState, task: string): Promise<{ resul
     });
 
     for (let i = 0; i < state.maxIterations; i++) {
+        // Compress older turns before sending to LLM to keep context window bounded
+        messages = await applyContextWindow(messages, state.llm);
         state = { ...state, iteration: i, messages };
 
         const reply = await state.llm.chat(messages, Array.from(state.tools.values()));
