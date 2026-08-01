@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import type { AgentState, Message, Context, Skill, Memory, LLM, Tool } from './types';
 import { truncateOutput } from '../tools/truncator';
+import { selectRelevantSkills } from './skill-rag';
 
 export function createAgentState(cfg: {
     id?: string;
@@ -32,13 +33,13 @@ export function createAgentState(cfg: {
     };
 }
 
-function buildSystemPrompt(state: AgentState, learnings: string[], recent: string[], context: string[]): string {
+function buildSystemPrompt(state: AgentState, learnings: string[], recent: string[], context: string[], relevantSkills: Skill[]): string {
     let prompt = state.systemPrompt;
     prompt += `\n\n## Operational Directive\nYou MUST begin every task by using the \`think\` tool to create a numbered plan. Label each step: [READ] for safe observation, [INVESTIGATE] for deep analysis, [MUTATE] for state-changing actions. Present your full plan before executing any other tool.`;
 
-    if (state.skills.length) {
-        prompt += `\n\n## Skills Library\nUse these domain skills to guide your investigation:\n`;
-        for (const skill of state.skills) {
+    if (relevantSkills.length) {
+        prompt += `\n\n## Relevant Skills\nThese skills were selected as relevant to your current task:\n`;
+        for (const skill of relevantSkills) {
             prompt += `\n### ${skill.name}\n${skill.description}\n${skill.content}\n`;
         }
     }
@@ -70,7 +71,10 @@ export async function runAgent(state: AgentState, task: string): Promise<{ resul
     // Reverse to get chronological order (getRecent returns newest first)
     const recent = recentEntries.reverse().map(r => r.content.slice(0, 800));
 
-    const system = buildSystemPrompt(state, learnings, recent, context);
+    // Select only the top-3 most relevant skills for this task (RAG)
+    const relevantSkills = selectRelevantSkills(task, state.skills, 3);
+
+    const system = buildSystemPrompt(state, learnings, recent, context, relevantSkills);
 
     let messages: Message[] = [
         { role: 'system', content: system },
