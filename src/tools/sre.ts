@@ -1,18 +1,8 @@
-import { spawn } from 'bun';
 import type { Tool } from '../core/types';
+import { runShellCommand } from './exec-runner';
 
 async function sh(cmd: string, cwd?: string) {
-    const isWin = process.platform === 'win32';
-    const proc = spawn({
-        cmd: isWin ? ['cmd', '/c', cmd] : ['sh', '-c', cmd],
-        cwd: cwd || process.cwd(),
-        stdout: 'pipe',
-        stderr: 'pipe',
-    });
-    const out = await new Response(proc.stdout).text();
-    const err = await new Response(proc.stderr).text();
-    await proc.exited;
-    return out || err || '(no output)';
+    return runShellCommand(cmd, { cwd });
 }
 
 export const k8sTools: Tool[] = [

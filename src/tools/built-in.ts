@@ -1,21 +1,6 @@
-import { spawn } from 'bun'
 import type { Tool, Context, AgentDef } from '../core/types';
 import { createAgentState, runAgent } from '../core/agent';
-
-async function shell(command: string, cwd: string): Promise<string> {
-    const isWin = process.platform === 'win32';
-    const proc = spawn({
-        cmd: isWin ? ['cmd', '/c', command] : ['sh', '-c', command],
-        cwd,
-        stdout: 'pipe',
-        stderr: 'pipe',
-    });
-    const stdout = await new Response(proc.stdout).text();
-    const stderr = await new Response(proc.stderr).text();
-    const exit = await proc.exited;
-    if (exit !== 0 && !stdout) return `Exit ${exit}\n${stderr}`;
-    return stdout || stderr || '(no output)';
-}
+import { runShellCommand } from './exec-runner';
 
 export const execTool: Tool = {
     name: 'exec',
@@ -29,7 +14,7 @@ export const execTool: Tool = {
         required: ['command'],
     },
     handler: async (args: { command: string; cwd?: string }, ctx: Context) => {
-        return shell(args.command, args.cwd || ctx.workingDir);
+        return runShellCommand(args.command, { cwd: args.cwd || ctx.workingDir });
     },
     risk: 'mutate',
 };
