@@ -8,6 +8,7 @@ import { loadSkills, loadAgents } from './core/loader';
 import { execTool, readFileTool, writeFileTool, webFetchTool, thinkTool, createSpawnTool } from './tools/built-in';
 import { k8sTools, dockerTools, linuxTools } from './tools/sre';
 import { connectMCP } from './mcp/connector';
+import { isAutoApprovable } from './tools/security';
 import type { Tool, AgentState } from './core/types';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -62,16 +63,13 @@ async function main() {
     allTools.push(createSpawnTool(agentDefs, allTools));
 
     const onApprove = async (tool: string, args: any, risk: string): Promise<boolean> => {
-        // Auto-approve: read-only kubectl/docker/helm subcommands ONLY
-        if (tool === 'kubectl' || tool === 'docker' || tool === 'helm') {
-          const cmd = (args.command || '') as string;
-          const readVerbs = ['get', 'describe', 'logs', 'top', 'status', 'list', 'inspect', 'ps', 'images', 'stats'];
-          const verb = cmd.trim().split(/\s+/)[0] ?? '';
-          if (readVerbs.includes(verb)) return true;
+        // Auto-approve: read-only kubectl/docker/helm subcommands ONLY (AST-validated, no operators)
+        if (isAutoApprovable(tool, args)) {
+          return true;
         }
-      
+
         // NEVER auto-approve exec — redirections (cat > file, echo > file) bypass word-level checks
-      
+
         if (AUTO_APPROVE.includes(risk) || AUTO_APPROVE.includes('all')) return true;
       
         console.log(`\n\x1b[41m\x1b[37m 🔒 APPROVAL REQUIRED \x1b[0m`);
