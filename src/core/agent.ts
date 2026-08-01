@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import type { AgentState, Message, Context, Skill, Memory, LLM, Tool } from './types';
+import { truncateOutput } from '../tools/truncator';
 
 export function createAgentState(cfg: {
     id?: string;
@@ -139,11 +140,13 @@ export async function runAgent(state: AgentState, task: string): Promise<{ resul
                 result = `Error: ${err.message}`;
             }
 
-            messages = [...messages, { role: 'tool', content: result, tool_call_id: call.id }];
+            const truncatedResult = truncateOutput(result);
+
+            messages = [...messages, { role: 'tool', content: truncatedResult, tool_call_id: call.id }];
             await state.memory.add({
                 agent_id: state.id,
                 type: 'conversation',
-                content: `Tool ${call.function.name}: ${result.slice(0, 2000)}`,
+                content: `Tool ${call.function.name}: ${truncatedResult.slice(0, 2000)}`,
             });
         }
     }
