@@ -94,11 +94,12 @@ export function createSpawnTool(agentDefs: AgentDef[], allTools: Tool[]): Tool {
             type: 'object',
             properties: {
                 agent_name: { type: 'string', description: 'Agent preset name' },
-                task: { type: 'string' },
+                task: { type: 'string', description: 'Task prompt for the sub-agent' },
+                async: { type: 'boolean', description: 'Set true to run sub-agent in background without blocking parent agent' },
             },
             required: ['agent_name', 'task'],
         },
-        handler: async (args: { agent_name: string; task: string }, ctx: Context) => {
+        handler: async (args: { agent_name: string; task: string; async?: boolean }, ctx: Context) => {
             const def = agentDefs.find(a => a.name === args.agent_name);
             if (!def) return `Agent "${args.agent_name}" not found. Available: ${agentDefs.map(a => a.name).join(', ')}`;
 
@@ -112,7 +113,13 @@ export function createSpawnTool(agentDefs: AgentDef[], allTools: Tool[]): Tool {
                 parentId: ctx.agentId,
                 workingDir: ctx.workingDir,
                 onApprove: ctx.onApprove,
+                taskRunner: ctx.taskRunner,
             });
+
+            if (args.async && ctx.taskRunner) {
+              const taskRecord = ctx.taskRunner.submitTask(subState, args.task);
+              return `[Sub-agent "${def.name}" spawned in background with Task ID: ${taskRecord.id}]`;
+            }
 
             const { result } = await runAgent(subState, args.task);
             return `--- ${def.name} output ---\n${result}`;

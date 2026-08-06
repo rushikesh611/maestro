@@ -17,6 +17,7 @@ export function createAgentState(cfg: {
     workingDir?: string;
     parentId?: string;
     onApprove?: AgentState['onApprove'];
+    taskRunner?: AgentState['taskRunner'];
 }): AgentState {
     return {
         id: cfg.id || randomUUID(),
@@ -32,6 +33,7 @@ export function createAgentState(cfg: {
         iteration: 0,
         parentId: cfg.parentId,
         onApprove: cfg.onApprove,
+        taskRunner: cfg.taskRunner,
     };
 }
 
@@ -139,6 +141,7 @@ export async function runAgent(state: AgentState, task: string): Promise<{ resul
                     workingDir: state.workingDir,
                     skills: state.skills,
                     onApprove: state.onApprove,
+                    taskRunner: state.taskRunner,
                 };
 
                 result = tool

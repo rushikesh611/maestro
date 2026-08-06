@@ -45,6 +45,7 @@ export interface Context {
     workingDir: string;
     skills: Skill[];
     onApprove?: (tool: string, args: any, risk: string) => Promise<boolean>;
+    taskRunner?: any;
 }
 
 export interface AgentState {
@@ -61,6 +62,7 @@ export interface AgentState {
     iteration: number;
     parentId?: string;
     onApprove?: (tool: string, args: any, risk: string) => Promise<boolean>;
+    taskRunner?: any;
 }
 
 export interface LLMConfig {
