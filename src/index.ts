@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url';
 import { createLLM } from './core/llm';
 import { createMemory } from './core/memory';
 import { createAgentState, runAgent } from './core/agent';
-import { loadSkills, loadAgents } from './core/loader';
+import { loadSkills, loadAgents, loadPluginResources } from './core/loader';
 import { execTool, readFileTool, writeFileTool, webFetchTool, thinkTool, createSpawnTool } from './tools/built-in';
 import { k8sTools, dockerTools, linuxTools } from './tools/sre';
 import { connectMCP } from './mcp/connector';
@@ -26,6 +26,7 @@ const AUTO_APPROVE = process.env.AUTO_APPROVE?.split(',') || [];
 
 let currentState: AgentState | null = null;
 let mcpCleanup: (() => Promise<void>) | null = null;
+let approvalHandler: ((tool: string, args: any, risk: string) => Promise<boolean>) | null = null;
 const taskRunner = new TaskRunner();
 
 async function main() {
@@ -45,10 +46,14 @@ async function main() {
 
     const skills = await loadSkills(join(__dirname, 'skills'));
     const agentDefs = await loadAgents(join(__dirname, 'agents'));
+    const pluginResources = await loadPluginResources({ workspaceRoot: process.cwd(), homeDir: process.env.HOME || process.env.USERPROFILE });
+    const pluginSkills = pluginResources.skills;
+    const pluginAgents = pluginResources.agents;
+    const pluginTools = pluginResources.tools;
     const sreDef = agentDefs.find(a => a.name === 'sre');
 
     const baseTools: Tool[] = [execTool, readFileTool, writeFileTool, webFetchTool, thinkTool];
-    const allTools: Tool[] = [...baseTools, ...k8sTools, ...dockerTools, ...linuxTools];
+    const allTools: Tool[] = [...baseTools, ...k8sTools, ...dockerTools, ...linuxTools, ...pluginTools];
 
     if (MCP_COMMAND) {
         try {
@@ -62,9 +67,9 @@ async function main() {
         }
     }
 
-    allTools.push(createSpawnTool(agentDefs, allTools));
+    allTools.push(createSpawnTool([...agentDefs, ...pluginAgents], allTools));
 
-    const onApprove = async (tool: string, args: any, risk: string): Promise<boolean> => {
+    approvalHandler = async (tool: string, args: any, risk: string): Promise<boolean> => {
         // Auto-approve: read-only kubectl/docker/helm subcommands ONLY (AST-validated, no operators)
         if (isAutoApprovable(tool, args)) {
           return true;
@@ -91,13 +96,16 @@ async function main() {
         tools: allTools,
         llm,
         memory,
-        skills,
+        skills: [...skills, ...pluginSkills],
         maxIterations: 50,
-        onApprove,
+        onApprove: approvalHandler || undefined,
     });
 
     console.log('🚀 SRE Agent ready.');
-    console.log(`   Skills: ${skills.length} | Agents: ${agentDefs.length} | Tools: ${allTools.length}`);
+    console.log(`   Skills: ${skills.length + pluginSkills.length} | Agents: ${agentDefs.length + pluginAgents.length} | Tools: ${allTools.length}`);
+    if (pluginResources.plugins.length) {
+        console.log(`   Plugins: ${pluginResources.plugins.map(p => p.name).join(', ')}`);
+    }
     console.log(`   LLM: ${LLM_MODEL} via OpenRouter`);
     console.log('   Type a task or "exit"\n');
 
@@ -179,12 +187,41 @@ async function runRepl() {
             continue;
           }
 
+          if (cmd === '/reload') {
+            try {
+              const pluginResources = await loadPluginResources({ workspaceRoot: process.cwd(), homeDir: process.env.HOME || process.env.USERPROFILE });
+              const freshSkills = [...(await loadSkills(join(__dirname, 'skills'))), ...pluginResources.skills];
+              const freshAgentDefs = [...(await loadAgents(join(__dirname, 'agents'))), ...pluginResources.agents];
+              const freshTools = [...[execTool, readFileTool, writeFileTool, webFetchTool, thinkTool], ...k8sTools, ...dockerTools, ...linuxTools, ...pluginResources.tools];
+              currentState = createAgentState({
+                id: currentState?.id || 'main',
+                name: currentState?.name || 'sre-agent',
+                systemPrompt: freshAgentDefs.find(a => a.name === 'sre')?.systemPrompt || currentState?.systemPrompt || 'You are an SRE agent.',
+                tools: freshTools,
+                llm: currentState?.llm || createLLM({ apiKey: LLM_API_KEY, model: LLM_MODEL, baseURL: LLM_BASE_URL, siteUrl: SITE_URL, siteName: SITE_NAME }),
+                memory: currentState?.memory || await createMemory(TURSO_URL, TURSO_TOKEN),
+                skills: freshSkills,
+                maxIterations: currentState?.maxIterations ?? 50,
+                workingDir: currentState?.workingDir,
+                parentId: currentState?.parentId,
+                onApprove: approvalHandler || undefined,
+                taskRunner,
+              });
+              console.log(`\n♻️ Reloaded plugins: ${pluginResources.plugins.length ? pluginResources.plugins.map(p => p.name).join(', ') : 'none'}\n`);
+              continue;
+            } catch (e: any) {
+              console.log(`\n❌ Reload failed: ${e.message}\n`);
+              continue;
+            }
+          }
+
           if (cmd === '/help') {
             console.log('\n💡 Maestro Commands:');
             console.log('   /bg <prompt>      - Run task in background');
             console.log('   /tasks            - List background tasks');
             console.log('   /view <task-id>   - View task result/status');
             console.log('   /cancel <task-id> - Cancel background task');
+            console.log('   /reload           - Reload plugins and tool definitions');
             console.log('   exit              - Exit Maestro\n');
             continue;
           }

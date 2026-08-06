@@ -1,11 +1,39 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { Tool } from '../core/types';
 
-export async function connectMCP(command: string, args: string[]): Promise<{ tools: Tool[]; close: () => Promise<void> }> {
-    const transport = new StdioClientTransport({ command, args });
-    const client = new Client({ name: 'sre-agent', version: '1.0.0' });
-    await client.connect(transport);
+function createClient(): Client {
+    return new Client({ name: 'sre-agent', version: '1.0.0' });
+}
+
+export async function connectMCP(target: string, args: string[]): Promise<{ tools: Tool[]; close: () => Promise<void> }> {
+    let transport: any;
+    let client: Client;
+
+    const isHttpTarget = /^https?:\/\//i.test(target);
+
+    if (isHttpTarget) {
+        const url = new URL(target);
+        const streamableClient = createClient();
+        try {
+            const streamableTransport = new StreamableHTTPClientTransport(url);
+            await streamableClient.connect(streamableTransport);
+            transport = streamableTransport;
+            client = streamableClient;
+        } catch (error) {
+            const sseClient = createClient();
+            const sseTransport = new SSEClientTransport(url);
+            await sseClient.connect(sseTransport);
+            transport = sseTransport;
+            client = sseClient;
+        }
+    } else {
+        transport = new StdioClientTransport({ command: target, args });
+        client = createClient();
+        await client.connect(transport);
+    }
 
     const { tools } = await client.listTools();
 
@@ -23,8 +51,16 @@ export async function connectMCP(command: string, args: string[]): Promise<{ too
     return {
         tools: mappedTools,
         close: async () => {
-            await transport.close();
-            await client.close();
+            try {
+                await transport.close();
+            } catch {
+                // ignore transport close errors
+            }
+            try {
+                await client.close();
+            } catch {
+                // ignore client close errors
+            }
         },
     };
 }
