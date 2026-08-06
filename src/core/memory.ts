@@ -3,12 +3,26 @@ import { randomUUID } from 'crypto';
 import type { MemoryEntry, Memory } from './types';
 
 /**
- * FTS5 MATCH treats punctuation as query operators.
- * Strip everything except alphanumeric and spaces to prevent syntax errors.
+ * Formats a raw user query string safely for SQLite FTS5 MATCH expressions.
+ * Preserves SRE punctuation (IP addresses, pod names, path slashes, status codes)
+ * by escaping internal double quotes and wrapping punctuated tokens in phrase quotes.
  */
-function sanitizeFts5(query: string): string {
-  const cleaned = query.replace(/[^a-zA-Z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
-  return cleaned || 'nullquery'; // fallback that matches nothing
+export function sanitizeFts5(query: string): string {
+  const trimmed = query.trim();
+  if (!trimmed) return 'nullquery';
+
+  const tokens = trimmed.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return 'nullquery';
+
+  const formattedTokens = tokens.map(token => {
+    const escaped = token.replace(/"/g, '""');
+    if (/[^a-zA-Z0-9]/.test(token) || /^(AND|OR|NOT|NEAR)$/i.test(token)) {
+      return `"${escaped}"`;
+    }
+    return escaped;
+  });
+
+  return formattedTokens.join(' ');
 }
 
 export async function createMemory(url: string, authToken?: string): Promise<Memory> {
@@ -33,16 +47,31 @@ export async function createMemory(url: string, authToken?: string): Promise<Mem
   const search = async (agentId: string, query: string, type?: string, limit = 5): Promise<MemoryEntry[]> => {
     const safeQuery = sanitizeFts5(query);
 
-    let sql = `
-      SELECT m.* FROM memory m
-      JOIN memory_fts fts ON m.rowid = fts.rowid
-      WHERE m.agent_id = ? AND fts.content MATCH ?
-    `;
-    const args: any[] = [agentId, safeQuery];
-    if (type) { sql += ` AND m.type = ?`; args.push(type); }
-    sql += ` ORDER BY rank LIMIT ?`;
-    args.push(limit);
-    return (await db.execute({ sql, args })).rows as unknown as MemoryEntry[];
+    try {
+      let sql = `
+        SELECT m.* FROM memory m
+        JOIN memory_fts fts ON m.rowid = fts.rowid
+        WHERE m.agent_id = ? AND fts.content MATCH ?
+      `;
+      const args: any[] = [agentId, safeQuery];
+      if (type) { sql += ` AND m.type = ?`; args.push(type); }
+      sql += ` ORDER BY rank LIMIT ?`;
+      args.push(limit);
+
+      const rows = (await db.execute({ sql, args })).rows as unknown as MemoryEntry[];
+      if (rows.length > 0) return rows;
+    } catch {
+      // FTS MATCH query syntax issue fallback
+    }
+
+    // Fallback: literal SQL LIKE substring search
+    let fallbackSql = `SELECT * FROM memory WHERE agent_id = ? AND content LIKE ?`;
+    const fallbackArgs: any[] = [agentId, `%${query.trim()}%`];
+    if (type) { fallbackSql += ` AND type = ?`; fallbackArgs.push(type); }
+    fallbackSql += ` ORDER BY created_at DESC LIMIT ?`;
+    fallbackArgs.push(limit);
+
+    return (await db.execute({ sql: fallbackSql, args: fallbackArgs })).rows as unknown as MemoryEntry[];
   };
 
   const memory: Memory = {
@@ -80,14 +109,7 @@ export async function createMemory(url: string, authToken?: string): Promise<Mem
     },
 
     async getRelevantContext(agentId, query, limit = 5) {
-      const safeQuery = sanitizeFts5(query);
-      const sql = `
-        SELECT m.* FROM memory m
-        JOIN memory_fts fts ON m.rowid = fts.rowid
-        WHERE m.agent_id = ? AND fts.content MATCH ?
-        ORDER BY rank LIMIT ?
-      `;
-      const rows = (await db.execute({ sql, args: [agentId, safeQuery, limit] })).rows as unknown as MemoryEntry[];
+      const rows = await search(agentId, query, undefined, limit);
       return rows.map(r => `[${r.type}] ${r.content.slice(0, 500)}`);
     },
   };
