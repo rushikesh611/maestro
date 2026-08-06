@@ -3,6 +3,7 @@ import type { AgentState, Message, Context, Skill, Memory, LLM, Tool } from './t
 import { truncateOutput } from '../tools/truncator';
 import { selectRelevantSkills } from './skill-rag';
 import { applyContextWindow } from './context-window';
+import { reflectAndStoreLearnings } from './reflection';
 
 export function createAgentState(cfg: {
     id?: string;
@@ -104,7 +105,7 @@ export async function runAgent(state: AgentState, task: string): Promise<{ resul
               content: `Assistant: ${finalContent}`,
             });
             // Don't await — let the user see the result immediately
-            reflect(state, task, finalContent).catch(() => {});
+            reflectAndStoreLearnings(state.llm, state.memory, state.id, task, finalContent).catch(() => {});
             return { result: finalContent, state: { ...state, messages } };
           }
 
@@ -159,24 +160,4 @@ export async function runAgent(state: AgentState, task: string): Promise<{ resul
     }
 
     return { result: 'Max iterations reached.', state: { ...state, messages } };
-}
-
-async function reflect(state: AgentState, task: string, result: string): Promise<void> {
-    const prompt = `Task: ${task}\nResult: ${result}\n\nExtract 1-3 concise operational learnings (debug patterns, fixes, or investigation shortcuts) for similar future tasks. Reply NONE if nothing novel.`;
-    try {
-        const res = await state.llm.chat([
-            { role: 'system', content: 'You extract SRE operational learnings.' },
-            { role: 'user', content: prompt },
-        ]);
-        if (res.content && res.content !== 'NONE') {
-            await state.memory.add({
-                agent_id: state.id,
-                type: 'learning',
-                content: res.content,
-                metadata: JSON.stringify({ task: task.slice(0, 200) }),
-            });
-        }
-    } catch {
-        // Best-effort
-    }
 }
