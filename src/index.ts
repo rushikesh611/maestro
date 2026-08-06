@@ -9,6 +9,7 @@ import { execTool, readFileTool, writeFileTool, webFetchTool, thinkTool, createS
 import { k8sTools, dockerTools, linuxTools } from './tools/sre';
 import { connectMCP } from './mcp/connector';
 import { isAutoApprovable } from './tools/security';
+import { TaskRunner } from './core/task-runner';
 import type { Tool, AgentState } from './core/types';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -25,6 +26,7 @@ const AUTO_APPROVE = process.env.AUTO_APPROVE?.split(',') || [];
 
 let currentState: AgentState | null = null;
 let mcpCleanup: (() => Promise<void>) | null = null;
+const taskRunner = new TaskRunner();
 
 async function main() {
     if (!LLM_API_KEY) {
@@ -115,6 +117,78 @@ async function runRepl() {
         const trimmed = input.trim();
         if (trimmed === 'exit' || trimmed === 'quit') break;
         if (!trimmed || !currentState) continue;
+
+        // Slash command router
+        if (trimmed.startsWith('/')) {
+          const [cmd, ...args] = trimmed.split(/\s+/);
+          const subArg = args.join(' ');
+
+          if (cmd === '/bg' || cmd === '/submit') {
+            if (!subArg) {
+              console.log(' Usage: /bg <task prompt>\n');
+              continue;
+            }
+            const task = taskRunner.submitTask(currentState, subArg);
+            console.log(`\n🚀 Background task submitted: [${task.id}]\n`);
+            continue;
+          }
+
+          if (cmd === '/tasks' || cmd === '/jobs') {
+            const tasks = taskRunner.listTasks();
+            if (tasks.length === 0) {
+              console.log('\n📋 No background tasks recorded.\n');
+              continue;
+            }
+            console.log('\n📋 Background Tasks:');
+            for (const t of tasks) {
+              const dur = t.completedAt ? `${((t.completedAt - t.createdAt) / 1000).toFixed(1)}s` : 'running...';
+              console.log(`  [${t.id}] ${t.status.toUpperCase()} | ${t.taskPrompt.slice(0, 40)} | Duration: ${dur}`);
+            }
+            console.log('');
+            continue;
+          }
+
+          if (cmd === '/view' || cmd === '/attach') {
+            if (!subArg) {
+              console.log(' Usage: /view <task-id>\n');
+              continue;
+            }
+            const task = taskRunner.getTask(subArg);
+            if (!task) {
+              console.log(`❌ Task [${subArg}] not found.\n`);
+              continue;
+            }
+            console.log(`\n📋 Task [${task.id}] Status: ${task.status.toUpperCase()}`);
+            console.log(`   Prompt: ${task.taskPrompt}`);
+            if (task.result) console.log(`\nResult:\n${task.result}\n`);
+            if (task.error) console.log(`\nError:\n${task.error}\n`);
+            continue;
+          }
+
+          if (cmd === '/cancel') {
+            if (!subArg) {
+              console.log(' Usage: /cancel <task-id>\n');
+              continue;
+            }
+            const ok = taskRunner.cancelTask(subArg);
+            if (ok) {
+              console.log(`\n🛑 Task [${subArg}] cancelled.\n`);
+            } else {
+              console.log(`❌ Could not cancel task [${subArg}].\n`);
+            }
+            continue;
+          }
+
+          if (cmd === '/help') {
+            console.log('\n💡 Maestro Commands:');
+            console.log('   /bg <prompt>      - Run task in background');
+            console.log('   /tasks            - List background tasks');
+            console.log('   /view <task-id>   - View task result/status');
+            console.log('   /cancel <task-id> - Cancel background task');
+            console.log('   exit              - Exit Maestro\n');
+            continue;
+          }
+        }
 
         console.log('\n🤔 Working...\n');
         try {
