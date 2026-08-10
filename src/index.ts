@@ -517,7 +517,7 @@ process.on('SIGINT', handleSigint);
 process.on('SIGTERM', () => shutdown().finally(() => process.exit(0)));
 
 // ─── Background Task Notification Bus ────────────────────────────────────────
-// Fix #2 & #3: Route ALL background task events through printAbove() so they
+// Route ALL background task events through printAbove() so they
 // appear above the prompt as status banners, not interleaved with main output.
 
 function bgTag(taskId: string, agentName: string): string {
@@ -544,7 +544,7 @@ taskRunner.on('cancelled', (task: TaskRecord) => {
   printAbove(`${bgTag(task.id, task.agentName)} \x1b[33m⊘ Cancelled\x1b[0m`);
 });
 
-// Approval gate banners (fix #5)
+// Approval gate banners 
 taskRunner.on('task:waiting', (data: { taskId: string; prompt: string }) => {
   const task = taskRunner.getTask(data.taskId);
   const name = task?.agentName ?? 'agent';
@@ -564,7 +564,7 @@ taskRunner.on('task:output', (data: { taskId: string; role: string; content: str
 });
 
 // ─── Per-task Approval Handler (for background agents) ───────────────────────
-// Fix #5: Background agents use waitForInput instead of blocking main readline.
+// Background agents use waitForInput instead of blocking main readline.
 // Approval request shows as a banner; user resolves via /send <id> y/n.
 
 function createBgApprovalHandler(taskId: string) {
