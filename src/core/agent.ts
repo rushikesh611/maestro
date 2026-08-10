@@ -98,6 +98,14 @@ export async function runAgent(state: AgentState, task: string): Promise<{ resul
 
         const reply = await state.llm.chat(messages, Array.from(state.tools.values()));
 
+        // Emit token usage if available
+        if (reply.usage) {
+            state.taskRunner?.emit('task:log', {
+                taskId: state.id,
+                message: `📊 ${reply.usage.total_tokens ?? '?'}t (↑${reply.usage.prompt_tokens ?? '?'} ↓${reply.usage.completion_tokens ?? '?'})`,
+            });
+        }
+
         if (!reply.tool_calls) {
             const finalContent = reply.content ?? '(no response)';
             messages = [...messages, { role: 'assistant', content: finalContent }];
@@ -106,6 +114,9 @@ export async function runAgent(state: AgentState, task: string): Promise<{ resul
               type: 'conversation',
               content: `Assistant: ${finalContent}`,
             });
+            // Emit live output for real-time streaming
+            state.taskRunner?.emit('task:output', { taskId: state.id, role: 'assistant', content: finalContent });
+            state.taskRunner?.emit('task:output', { taskId: state.id, role: 'result', content: finalContent });
             // Don't await — let the user see the result immediately
             reflectAndStoreLearnings(state.llm, state.memory, state.id, task, finalContent).catch(() => {});
             return { result: finalContent, state: { ...state, messages } };
@@ -116,6 +127,10 @@ export async function runAgent(state: AgentState, task: string): Promise<{ resul
             content: reply.content ?? '',
             tool_calls: reply.tool_calls,
         }];
+
+        // Emit assistant message (with tool calls) for live streaming
+        const assistantContent = reply.content ?? `(calling ${reply.tool_calls.map(t => t.function.name).join(', ')})`;
+        state.taskRunner?.emit('task:output', { taskId: state.id, role: 'assistant', content: assistantContent });
 
         for (const call of reply.tool_calls) {
             const tool = state.tools.get(call.function.name);
@@ -159,6 +174,8 @@ export async function runAgent(state: AgentState, task: string): Promise<{ resul
                 type: 'conversation',
                 content: `Tool ${call.function.name}: ${truncatedResult.slice(0, 2000)}`,
             });
+            // Emit tool result for live streaming
+            state.taskRunner?.emit('task:output', { taskId: state.id, role: 'tool', content: `${call.function.name}: ${truncatedResult.slice(0, 500)}` });
         }
     }
 

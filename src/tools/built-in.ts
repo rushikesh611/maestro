@@ -1,5 +1,5 @@
 import type { Tool, Context, AgentDef } from '../core/types';
-import { createAgentState, runAgent } from '../core/agent';
+import { spawnAgent } from '../core/spawn';
 import { runShellCommand } from './exec-runner';
 
 export const execTool: Tool = {
@@ -74,6 +74,59 @@ export const webFetchTool: Tool = {
 };
 
 
+/**
+ * Tool that lets an agent pause and ask the user for input.
+ * The agent loop naturally blocks on the Promise returned by the handler
+ * until the user responds via `/send <task-id> <input>`.
+ */
+export const waitForInputTool: Tool = {
+    name: 'wait_for_input',
+    description: 'Pause and ask the user for additional input. Use when you need clarification, more information, or approval before proceeding. The task will wait until the user responds.',
+    parameters: {
+        type: 'object',
+        properties: {
+            question: { type: 'string', description: 'Question or prompt for the user' },
+        },
+        required: ['question'],
+    },
+    handler: async (args: { question: string }, ctx: Context) => {
+        if (!ctx.taskRunner) {
+            return 'No task runner available — cannot wait for input.';
+        }
+
+        // Show the question to the user
+        process.stdout.write(`\n\x1b[43m\x1b[30m ⏸️  WAITING \x1b[0m ${args.question}\n`);
+        process.stdout.write(`\x1b[90m   (Type your response below, or /send <task-id> for bg tasks)\x1b[0m\n\n`);
+
+        const tr = ctx.taskRunner as any;
+
+        // Start the event-based wait (works for background tasks via /send)
+        const bgPromise = ctx.taskRunner.waitForInput(ctx.agentId, args.question);
+
+        if (tr.isSyncAgent?.(ctx.agentId) || ctx.agentId === 'main') {
+            // ── Sync / foreground agent — REPL is blocked ─────────────────
+            // Prompt directly so the user can respond inline.
+            const { createInterface } = await import('readline');
+            const rli = createInterface({ input: process.stdin, output: process.stdout });
+            const input = await new Promise<string>((resolve) => {
+                rli.question('> ', (answer: string) => {
+                    rli.close();
+                    resolve(answer);
+                });
+            });
+            // Also resolve the bg promise (for cleanup / status tracking)
+            tr.sendInput?.(ctx.agentId, input);
+            return `User responded: ${input}`;
+        } else {
+            // ── Background task — main REPL is still live ─────────────────
+            // User will use /send <task-id> to respond.
+            const input = await bgPromise;
+            return `User responded: ${input}`;
+        }
+    },
+    risk: 'read',
+};
+
 export const thinkTool: Tool = {
     name: 'think',
     description: 'Use this to reason step-by-step and create a numbered plan before acting. Label steps: [READ], [INVESTIGATE], [MUTATE].',
@@ -100,13 +153,12 @@ export function createSpawnTool(agentDefs: AgentDef[], allTools: Tool[]): Tool {
             required: ['agent_name', 'task'],
         },
         handler: async (args: { agent_name: string; task: string; async?: boolean }, ctx: Context) => {
-            const def = agentDefs.find(a => a.name === args.agent_name);
-            if (!def) return `Agent "${args.agent_name}" not found. Available: ${agentDefs.map(a => a.name).join(', ')}`;
-
-            const subState = createAgentState({
-                name: def.name,
-                systemPrompt: def.systemPrompt,
-                tools: allTools,
+            return spawnAgent({
+                agentName: args.agent_name,
+                task: args.task,
+                async: args.async,
+                agentDefs,
+                allTools,
                 llm: ctx.llm,
                 memory: ctx.memory,
                 skills: ctx.skills,
@@ -115,14 +167,6 @@ export function createSpawnTool(agentDefs: AgentDef[], allTools: Tool[]): Tool {
                 onApprove: ctx.onApprove,
                 taskRunner: ctx.taskRunner,
             });
-
-            if (args.async && ctx.taskRunner) {
-              const taskRecord = ctx.taskRunner.submitTask(subState, args.task);
-              return `[Sub-agent "${def.name}" spawned in background with Task ID: ${taskRecord.id}]`;
-            }
-
-            const { result } = await runAgent(subState, args.task);
-            return `--- ${def.name} output ---\n${result}`;
         },
         risk: 'read',
     };

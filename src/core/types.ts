@@ -76,6 +76,12 @@ export interface LLMConfig {
 export interface LLMResponse {
     content: string | null;
     tool_calls?: ToolCall[];
+    /** Optional token usage reported by the provider. */
+    usage?: {
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        total_tokens?: number;
+    };
 }
 
 export interface LLM {

@@ -93,9 +93,17 @@ export function createLLM(config: LLMConfig): import('./types').LLM {
             throw new Error(`Empty choice[0].message: ${rawText.slice(0, 500)}`);
           }
 
+          // Extract token usage from OpenRouter response
+          const usage = data.usage;
+
           return {
             content: choice.content ?? null,
             tool_calls: choice.tool_calls,
+            usage: usage ? {
+              prompt_tokens: usage.prompt_tokens,
+              completion_tokens: usage.completion_tokens,
+              total_tokens: usage.total_tokens,
+            } : undefined,
           };
 
         } catch (err: any) {
