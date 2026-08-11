@@ -12,6 +12,7 @@ import { connectMCP } from './mcp/connector';
 import { isAutoApprovable } from './tools/security';
 import { TaskRunner, type TaskRecord } from './core/task-runner';
 import type { Tool, AgentState, AgentDef } from './core/types';
+import { TUI } from './tui/index';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -32,150 +33,196 @@ let agentDefsGlobal: AgentDef[] = [];
 let allToolsGlobal: Tool[] = [];
 let attachedTaskId: string | null = null;
 const taskRunner = new TaskRunner();
+const tui = new TUI();
 
 // ─── Terminal / Readline Setup ──────────────────────────────────────────────
-// Raw mode + keypress events enable inline editing (arrow, home/end, backspace),
-// Tab completion, and a responsive event-driven REPL.
+// Uses the TUI framework for full-screen terminal management.
+// readline is only used for Ctrl+C handling and the initial prompt fallback.
 
 const COMMANDS = [
-  { name: '/bg',        desc: '/bg <prompt>              Run task in background' },
-  { name: '/tasks',     desc: '/tasks                    List all background tasks' },
-  { name: '/view',      desc: '/view <id>                Show task conversation & result' },
-  { name: '/attach',    desc: '/attach <id>              Focus terminal on a bg task' },
-  { name: '/detach',    desc: '/detach                   Return to main agent' },
-  { name: '/send',      desc: '/send <id> <input>        Send input/approval to waiting task' },
-  { name: '/cancel',    desc: '/cancel <id>              Cancel a background task' },
-  { name: '/agents',    desc: '/agents                   List available agent presets' },
-  { name: '/assign',    desc: '/assign <agent> <task>    Run agent task in foreground' },
+  { name: '/bg', desc: '/bg <prompt>              Run task in background' },
+  { name: '/tasks', desc: '/tasks                    List all background tasks' },
+  { name: '/view', desc: '/view <id>                Show task conversation & result' },
+  { name: '/attach', desc: '/attach <id>              Focus terminal on a bg task' },
+  { name: '/detach', desc: '/detach                   Return to main agent' },
+  { name: '/send', desc: '/send <id> <input>        Send input/approval to waiting task' },
+  { name: '/cancel', desc: '/cancel <id>              Cancel a background task' },
+  { name: '/agents', desc: '/agents                   List available agent presets' },
+  { name: '/assign', desc: '/assign <agent> <task>    Run agent task in foreground' },
   { name: '/assign-bg', desc: '/assign-bg <agent> <task> Run agent task in background' },
-  { name: '/reload',    desc: '/reload                   Reload plugins without restart' },
-  { name: '/help',      desc: '/help                     Show all commands' },
+  { name: '/reload', desc: '/reload                   Reload plugins without restart' },
+  { name: '/help', desc: '/help                     Show all commands' },
 ];
 
-/**
- * Readline tab completer — works on systems where readline properly intercepts Tab.
- */
-function completer(line: string): [string[], string] {
-  const cmdNames = COMMANDS.map(c => c.name);
+// Wire up promptUser so wait_for_input tool uses the TUI's input handler
+// (no second readline, no conflict)
+taskRunner.promptUser = async (q: string) => {
+  const result = await tui.promptUser(q);
+  return result;
+};
 
-  if (line.startsWith('/')) {
-    const hits = cmdNames.filter(c => c.startsWith(line));
-    if (hits.length > 0) return [hits, line];
-    return [cmdNames, '/'];
-  }
+// ─── Ctrl+C: double-press to exit ────────────────────────────────────────────
 
-  if (line.startsWith('@')) {
-    const agentTags = agentDefsGlobal.flatMap(a => [`@${a.name}`, `@${a.name}/bg`, `@${a.name}/async`]);
-    const hits = agentTags.filter(n => n.startsWith(line));
-    return [hits.length ? hits : agentTags, line];
-  }
+let sigintCount = 0;
+let sigintTimer: ReturnType<typeof setTimeout> | null = null;
+let lastSigintMs = 0;
 
-  if (!line.trim()) return [cmdNames, ''];
-  return [[], line];
-}
+function handleSigint() {
+  const now = Date.now();
+  if (now - lastSigintMs < 150) return;
+  lastSigintMs = now;
 
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-  prompt: '> ',
-  terminal: true,
-  crlfDelay: Infinity,
-  completer,
-});
-
-// Enable keypress events for Tab handling fallback (Windows compatibility)
-readline.emitKeypressEvents(process.stdin);
-if (process.stdin.isTTY && typeof process.stdin.setRawMode === 'function') {
-  try { process.stdin.setRawMode(true); } catch {}
-}
-
-/** Prints a line above the active prompt without destroying the user's input. */
-function printAbove(message: string): void {
-  readline.clearLine(process.stdout, 0);
-  readline.cursorTo(process.stdout, 0);
-  process.stdout.write(message + '\n');
-  (rl as any)._refreshLine?.();
-}
-
-/**
- * Tab completion handler — invoked directly from keypress events.
- * More reliable than readline's built-in completer on Windows terminals.
- */
-function handleTab() {
-  const line = rl.line;
-  let completions: string[] = [];
-
-  if (line.startsWith('/')) {
-    completions = COMMANDS.map(c => c.name).filter(c => c.startsWith(line));
-  } else if (line.startsWith('@')) {
-    const agentTags = agentDefsGlobal.flatMap(a => [`@${a.name}`, `@${a.name}/bg`, `@${a.name}/async`]);
-    completions = agentTags.filter(n => n.startsWith(line));
+  sigintCount++;
+  if (sigintCount === 1) {
+    process.stdout.write(`\n\x1b[33m⚠️  Press Ctrl+C again within 2s to exit. Press Enter to keep going.\x1b[0m\n`);
+    if (sigintTimer) clearTimeout(sigintTimer);
+    sigintTimer = setTimeout(() => { sigintCount = 0; sigintTimer = null; }, 2000);
   } else {
-    completions = COMMANDS.map(c => c.name);
-  }
-
-  if (completions.length === 1 && completions[0] !== line) {
-    // Unique match — replace the line
-    rl.write(null, { ctrl: true, name: 'u' }); // clear
-    rl.write(completions[0] + ' ');
-  } else if (completions.length > 1) {
-    // Show options above the prompt
-    printAbove('\x1b[90m' + completions.join('  ') + '\x1b[0m');
-  } else if (completions.length === 0 && line) {
-    printAbove('\x1b[90m(no completions)\x1b[0m');
+    if (sigintTimer) clearTimeout(sigintTimer);
+    shutdown().finally(() => process.exit(0));
   }
 }
 
-// Listen for Tab keypress (fallback for terminals where readline completer doesn't fire)
-process.stdin.on('keypress', (str: string, key: any) => {
-  // Only handle actual Tab key — str is '\t' or key.name is 'tab'
-  // Skip for all other keys (arrows, backspace, regular chars, etc.)
-  if (str === '\t' || (key && key.name === 'tab')) {
-    handleTab();
+process.on('SIGINT', handleSigint);
+process.on('SIGTERM', () => shutdown().finally(() => process.exit(0)));
+
+// ─── Background Task Notification Bus ────────────────────────────────────────
+
+function bgTag(taskId: string, agentName: string): string {
+  return `[bg:${taskId.slice(0, 6)} @${agentName}]`;
+}
+
+taskRunner.on('started', (task: TaskRecord) => {
+  tui.appendOutput({ type: 'system', text: `${bgTag(task.id, task.agentName)} ▶ Started` });
+});
+
+taskRunner.on('completed', (task: TaskRecord) => {
+  const dur = task.completedAt && task.startedAt
+    ? ` (${((task.completedAt - task.startedAt) / 1000).toFixed(1)}s)`
+    : '';
+  tui.appendOutput({ type: 'system', text: `${bgTag(task.id, task.agentName)} ✓ Completed${dur} — /view ${task.id}` });
+});
+
+taskRunner.on('failed', (task: TaskRecord) => {
+  const short = task.error?.slice(0, 80) ?? 'unknown error';
+  tui.appendOutput({ type: 'error', text: `${bgTag(task.id, task.agentName)} ✗ Failed: ${short}` });
+});
+
+taskRunner.on('cancelled', (task: TaskRecord) => {
+  tui.appendOutput({ type: 'system', text: `${bgTag(task.id, task.agentName)} ⊘ Cancelled` });
+});
+
+taskRunner.on('task:waiting', (data: { taskId: string; prompt: string }) => {
+  const task = taskRunner.getTask(data.taskId);
+  const name = task?.agentName ?? 'agent';
+  tui.appendOutput({ type: 'system', text: `🔒 ACTION REQUIRED ${bgTag(data.taskId, name)}` });
+  tui.appendOutput({ type: 'system', text: `   ${data.prompt}` });
+  tui.appendOutput({ type: 'system', text: `   Approve: /send ${data.taskId} y    Deny: /send ${data.taskId} n` });
+});
+
+taskRunner.on('task:output', (data: { taskId: string; role: string; content: string }) => {
+  if (attachedTaskId === data.taskId) {
+    const prefix = data.role === 'assistant' ? '🤖' : data.role === 'tool' ? '⚡' : '📋';
+    tui.appendOutput({ type: 'tool', text: `${prefix} ${data.content.slice(0, 300)}` });
   }
 });
 
-// ─── Event-driven REPL with Input Queuing ──────────────────────────────────
-// Uses rl.on('line') instead of blocking await rl.question().
-// When the main agent is busy (running an LLM call), new input is queued
-// with a visual indicator. Queued input auto-processes when the agent finishes.
+// ─── Per-task Approval Handler (for background agents) ───────────────────────
 
-let replBusy = false;
-let inputQueue: string[] = [];
-
-// Flag to distinguish rl.question() line events from normal REPL input.
-// When set, the on('line') handler skips the line (question() handles it).
-let inApprovalPrompt = false;
-
-/**
- * Prompts the user for approval or short input during an agent session.
- * Uses rl.question() under the hood; the inApprovalPrompt flag prevents
- * the event-driven handler from double-processing the response.
- */
-function ask(q: string): Promise<string> {
-  return new Promise(resolve => {
-    inApprovalPrompt = true;
-    rl.question(q, (answer: string) => {
-      // Resolve first — our on('line') handler will consume the flag
-      resolve(answer);
-    });
-  });
+function createBgApprovalHandler(taskId: string) {
+  return async (tool: string, args: any, risk: string): Promise<boolean> => {
+    if (isAutoApprovable(tool, args)) return true;
+    if (AUTO_APPROVE.includes(risk) || AUTO_APPROVE.includes('all')) return true;
+    const question = `🔒 APPROVAL [${tool}] risk:${risk.toUpperCase()} args:${JSON.stringify(args).slice(0, 120)}`;
+    const answer = await taskRunner.waitForInput(taskId, question);
+    return answer.trim().toLowerCase() === 'y';
+  };
 }
 
-/**
- * Main input handler — parses and executes the user's line.
- * This is async so queued input can await its completion.
- */
-async function processLine(line: string): Promise<void> {
-  const trimmed = line.trim();
+// ─── Main Bootstrap ───────────────────────────────────────────────────────────
 
-  if (trimmed === 'exit' || trimmed === 'quit') {
-    await shutdown();
-    process.exit(0);
-    return;
+async function main() {
+  if (!LLM_API_KEY) {
+    console.error('❌ LLM_API_KEY is required. Set it in .env');
+    process.exit(1);
   }
 
-  if (!trimmed || !currentState) return;
+  const memory = await createMemory(TURSO_URL, TURSO_TOKEN);
+  const llm = createLLM({
+    apiKey: LLM_API_KEY, model: LLM_MODEL, baseURL: LLM_BASE_URL,
+    siteUrl: SITE_URL, siteName: SITE_NAME,
+  });
+
+  const skills = await loadSkills(join(__dirname, 'skills'));
+  const agentDefs = await loadAgents(join(__dirname, 'agents'));
+  const pluginResources = await loadPluginResources({ workspaceRoot: process.cwd(), homeDir: process.env.HOME || process.env.USERPROFILE });
+  const pluginSkills = pluginResources.skills;
+  const pluginAgents = pluginResources.agents;
+  const pluginTools = pluginResources.tools;
+  const sreDef = agentDefs.find(a => a.name === 'sre');
+
+  const baseTools: Tool[] = [execTool, readFileTool, writeFileTool, webFetchTool, thinkTool, waitForInputTool];
+  const allTools: Tool[] = [...baseTools, ...k8sTools, ...dockerTools, ...linuxTools, ...pluginTools];
+
+  if (MCP_COMMAND) {
+    try {
+      const mcpArgs = process.env.MCP_ARGS?.split(' ') || [];
+      const mcp = await connectMCP(MCP_COMMAND, mcpArgs);
+      allTools.push(...mcp.tools);
+      mcpCleanup = mcp.close;
+    } catch (e: any) {
+      console.warn(`⚠️ MCP failed: ${e.message}`);
+    }
+  }
+
+  allTools.push(createSpawnTool([...agentDefs, ...pluginAgents], allTools));
+
+  agentDefsGlobal = [...agentDefs, ...pluginAgents];
+  allToolsGlobal = allTools;
+
+  // Approval handler — uses TUI confirm dialog
+  approvalHandler = async (tool: string, args: any, risk: string): Promise<boolean> => {
+    if (isAutoApprovable(tool, args)) return true;
+    if (AUTO_APPROVE.includes(risk) || AUTO_APPROVE.includes('all')) return true;
+
+    const question = `Approve ${tool}? risk:${risk.toUpperCase()} args:${JSON.stringify(args).slice(0, 120)}`;
+    return await tui.confirm(question, risk === 'dangerous');
+  };
+
+  currentState = createAgentState({
+    id: 'main', name: 'sre-agent',
+    systemPrompt: sreDef?.systemPrompt || 'You are an SRE agent.',
+    tools: allTools, llm, memory,
+    skills: [...skills, ...pluginSkills],
+    maxIterations: 50,
+    onApprove: approvalHandler || undefined,
+    taskRunner,
+  });
+
+  // Configure TUI
+  tui.setAutocompleteCommands(COMMANDS.map(c => ({ name: c.name, description: c.desc })));
+
+  tui.appendOutput({ type: 'system', text: `Maestro ready` });
+  tui.appendOutput({ type: 'system', text: `Skills: ${skills.length + pluginSkills.length} | Agents: ${agentDefs.length + pluginAgents.length} | Tools: ${allTools.length}` });
+  if (pluginResources.plugins.length) {
+    tui.appendOutput({ type: 'system', text: `Plugins: ${pluginResources.plugins.map(p => p.name).join(', ')}` });
+  }
+  tui.appendOutput({ type: 'system', text: `Type @agent/bg <task>, /help, or just ask` });
+  tui.appendOutput({ type: 'divider', text: '' });
+
+  // Handle user submits
+  tui.on('submit', (text: string) => {
+    handleSubmit(text);
+  });
+
+  // Start the TUI
+  tui.start();
+}
+
+// ─── Input Router ────────────────────────────────────────────────────────────
+
+async function handleSubmit(trimmed: string) {
+  if (!currentState) return;
 
   // ── Slash command router ──────────────────────────────────────────────────
   if (trimmed.startsWith('/')) {
@@ -183,130 +230,109 @@ async function processLine(line: string): Promise<void> {
     const subArg = args.join(' ');
 
     if (cmd === '/bg' || cmd === '/submit') {
-      if (!subArg) {
-        console.log(' Usage: /bg <task prompt>\n');
-        return;
-      }
+      if (!subArg) { tui.appendOutput({ type: 'system', text: 'Usage: /bg <task prompt>' }); return; }
       const task = taskRunner.submitTask(currentState, subArg);
-      console.log(`\n🚀 Background task submitted: [${task.id}]\n`);
+      tui.appendOutput({ type: 'system', text: `🚀 Background task submitted: [${task.id}]` });
       return;
     }
 
     if (cmd === '/tasks' || cmd === '/jobs') {
       const tasks = taskRunner.listTasks();
-      if (tasks.length === 0) {
-        console.log('\n📋 No background tasks recorded.\n');
-        return;
-      }
-      console.log('\n📋 Background Tasks:');
+      if (tasks.length === 0) { tui.appendOutput({ type: 'system', text: '📋 No background tasks recorded.' }); return; }
+      tui.appendOutput({ type: 'system', text: '📋 Background Tasks:' });
       for (const t of tasks) {
         const elapsed = t.completedAt
           ? `${((t.completedAt - t.createdAt) / 1000).toFixed(1)}s`
-          : t.startedAt
-            ? `${((Date.now() - t.startedAt) / 1000).toFixed(1)}s ▶`
-            : 'queued';
-        const statusColor = t.status === 'completed'
-          ? '\x1b[32m' : t.status === 'failed'
-            ? '\x1b[31m' : t.status === 'waiting'
-              ? '\x1b[33m' : t.status === 'running'
-                ? '\x1b[36m' : '\x1b[90m';
-        console.log(`  [${t.id}] ${statusColor}${t.status.toUpperCase()}\x1b[0m @${t.agentName} | ${t.taskPrompt.slice(0, 45)} | ${elapsed}`);
+          : t.startedAt ? `${((Date.now() - t.startedAt) / 1000).toFixed(1)}s ▶` : 'queued';
+        tui.appendOutput({ type: 'system', text: `  [${t.id}] ${t.status.toUpperCase()} @${t.agentName} | ${t.taskPrompt.slice(0, 45)} | ${elapsed}` });
       }
-      console.log('');
       return;
     }
 
     if (cmd === '/view') {
-      if (!subArg) { console.log(' Usage: /view <task-id>\n'); return; }
+      if (!subArg) { tui.appendOutput({ type: 'system', text: 'Usage: /view <task-id>' }); return; }
       const task = taskRunner.getTask(subArg);
-      if (!task) { console.log(`❌ Task [${subArg}] not found.\n`); return; }
+      if (!task) { tui.appendOutput({ type: 'error', text: `Task [${subArg}] not found.` }); return; }
       const dur = task.completedAt
         ? `${((task.completedAt - task.createdAt) / 1000).toFixed(1)}s`
         : task.startedAt ? `${((Date.now() - task.startedAt) / 1000).toFixed(1)}s running...` : 'queued';
-      console.log(`\n📋 Task [${task.id}]  ${task.status.toUpperCase()}  (${dur})`);
-      console.log(`   Agent: @${task.agentName}`);
-      console.log(`   Prompt: ${task.taskPrompt}`);
+      tui.appendOutput({ type: 'system', text: `📋 Task [${task.id}]  ${task.status.toUpperCase()}  (${dur})` });
+      tui.appendOutput({ type: 'system', text: `   Agent: @${task.agentName} | Prompt: ${task.taskPrompt}` });
       if (task.waitingForInput && task.waitingPrompt) {
-        console.log(`\n⏸️  Waiting for input:`);
-        console.log(`   ${task.waitingPrompt}`);
-        console.log(`\x1b[90m   → /send ${task.id} y   or   /send ${task.id} n\x1b[0m`);
+        tui.appendOutput({ type: 'system', text: `⏸️  Waiting: ${task.waitingPrompt}` });
+        tui.appendOutput({ type: 'system', text: `   → /send ${task.id} y   or   /send ${task.id} n` });
       }
       if (task.messages.length > 0) {
-        console.log(`\n── Conversation ──`);
         for (const msg of task.messages) {
           if (msg.role === 'system') continue;
-          const prefix = msg.role === 'user' ? '🧑' : msg.role === 'assistant' ? '🤖' : msg.role === 'tool' ? '🔧' : '❓';
-          if (msg.content) console.log(`   ${prefix} ${msg.content.slice(0, 500)}`);
-          if (msg.tool_calls) {
-            for (const tc of msg.tool_calls) {
-              console.log(`     ⚡ ${tc.function.name}(${tc.function.arguments.slice(0, 200)})`);
-            }
-          }
+          const prefix = msg.role === 'user' ? '🧑' : msg.role === 'assistant' ? '🤖' : '🔧';
+          if (msg.content) tui.appendOutput({ type: 'tool', text: `${prefix} ${msg.content.slice(0, 500)}` });
         }
       }
-      if (task.result && task.status === 'completed') console.log(`\n✓ Final result:\n${task.result}\n`);
-      if (task.error) console.log(`\n✗ Error:\n${task.error}\n`);
-      console.log('');
+      if (task.result && task.status === 'completed') tui.appendOutput({ type: 'result', text: task.result });
+      if (task.error) tui.appendOutput({ type: 'error', text: task.error });
       return;
     }
 
     if (cmd === '/send') {
       const [sendTarget, ...sendParts] = args;
-      if (!sendTarget || sendParts.length === 0) { console.log(' Usage: /send <task-id> <input>\n'); return; }
-      const sendInputText = sendParts.join(' ');
-      const ok = taskRunner.sendInput(sendTarget, sendInputText);
-      if (ok) { console.log(`\n📤 Sent input to task [${sendTarget}].\n`); }
-      else { console.log(`\n❌ Task [${sendTarget}] not found or not waiting for input.\n`); }
+      if (!sendTarget || sendParts.length === 0) { tui.appendOutput({ type: 'system', text: 'Usage: /send <task-id> <input>' }); return; }
+      const sendInput = sendParts.join(' ');
+      const ok = taskRunner.sendInput(sendTarget, sendInput);
+      tui.appendOutput({ type: 'system', text: ok ? `📤 Sent to [${sendTarget}]` : `❌ Task [${sendTarget}] not found or not waiting.` });
       return;
     }
 
     if (cmd === '/attach') {
-      if (!subArg) { console.log(' Usage: /attach <task-id>\n'); return; }
+      if (!subArg) { tui.appendOutput({ type: 'system', text: 'Usage: /attach <task-id>' }); return; }
       const task = taskRunner.getTask(subArg);
-      if (!task) { console.log(`❌ Task [${subArg}] not found.\n`); return; }
-      await attachToTask(task.id);
+      if (!task) { tui.appendOutput({ type: 'error', text: `Task [${subArg}] not found.` }); return; }
+      attachedTaskId = task.id;
+      tui.appendOutput({ type: 'system', text: `🔗 Attached to task [${task.id}] (@${task.agentName})` });
       return;
     }
 
     if (cmd === '/detach') {
       if (attachedTaskId) {
-        console.log(`\n🔓 Detached from task [${attachedTaskId}]. Task continues in background.\n`);
+        tui.appendOutput({ type: 'system', text: `🔓 Detached from task [${attachedTaskId}]` });
         attachedTaskId = null;
-      } else { console.log('\n⚠️  Not attached to any task.\n'); }
+      } else { tui.appendOutput({ type: 'system', text: '⚠️ Not attached to any task.' }); }
       return;
     }
 
     if (cmd === '/cancel') {
-      if (!subArg) { console.log(' Usage: /cancel <task-id>\n'); return; }
+      if (!subArg) { tui.appendOutput({ type: 'system', text: 'Usage: /cancel <task-id>' }); return; }
       const ok = taskRunner.cancelTask(subArg);
-      if (ok) { console.log(`\n🛑 Task [${subArg}] cancelled.\n`); }
-      else { console.log(`❌ Could not cancel task [${subArg}].\n`); }
+      tui.appendOutput({ type: 'system', text: ok ? `🛑 Task [${subArg}] cancelled.` : `❌ Could not cancel [${subArg}].` });
       return;
     }
 
     if (cmd === '/agents' || cmd === '/list-agents') {
-      if (agentDefsGlobal.length === 0) { console.log('\n👥 No agents available.\n'); return; }
-      console.log('\n👥 Available Agents:');
-      for (const def of agentDefsGlobal) console.log(`   @${def.name} - ${def.description || '(no description)'}`);
-      console.log('');
+      if (agentDefsGlobal.length === 0) { tui.appendOutput({ type: 'system', text: '👥 No agents available.' }); return; }
+      tui.appendOutput({ type: 'system', text: '👥 Available Agents:' });
+      for (const def of agentDefsGlobal) tui.appendOutput({ type: 'system', text: `   @${def.name} - ${def.description || '(no description)'}` });
       return;
     }
 
     if (cmd === '/assign' || cmd === '/assign-bg') {
-      const [agentName, ...taskParts] = args;
-      if (!agentName || taskParts.length === 0) { console.log(` Usage: /${cmd} <agent-name> <task prompt>\n`); return; }
-      const taskText = taskParts.join(' ');
+      const [rawAgentName, ...taskParts] = args;
+      const agentName = rawAgentName?.replace(/^@/, '');
+      if (!agentName || taskParts.length === 0) { tui.appendOutput({ type: 'system', text: `Usage: /${cmd.replace(/^\//, '')} <agent-name> <task prompt>` }); return; }
+      const task = taskParts.join(' ');
       const background = cmd === '/assign-bg';
+      tui.appendOutput({ type: 'system', text: `👤 Running @${agentName} ${background ? '(bg)' : ''}...` });
+      tui.setRunning(true);
       const result = await spawnAgent({
-        agentName, task: taskText, async: background,
+        agentName, task, async: background,
         agentDefs: agentDefsGlobal, allTools: allToolsGlobal,
         llm: currentState!.llm, memory: currentState!.memory,
         skills: currentState!.skills, parentId: currentState!.id,
         workingDir: currentState!.workingDir, onApprove: approvalHandler || undefined,
         taskRunner,
       });
-      if (background) { console.log(`\n🚀 Assigned task to @${agentName} in background: ${result}\n`); }
-      else { console.log(`\n📋 @${agentName} Result:\n${result}\n`); }
+      tui.setRunning(false);
+      if (background) { tui.appendOutput({ type: 'result', text: `🚀 Assigned to @${agentName}: ${result}` }); }
+      else { tui.appendOutput({ type: 'result', text: result }); }
       return;
     }
 
@@ -327,37 +353,22 @@ async function processLine(line: string): Promise<void> {
           workingDir: currentState?.workingDir, parentId: currentState?.parentId,
           onApprove: approvalHandler || undefined, taskRunner,
         });
-        console.log(`\n♻️  Reloaded plugins: ${pluginResources.plugins.length ? pluginResources.plugins.map(p => p.name).join(', ') : 'none'}\n`);
-      } catch (e: any) { console.log(`\n❌ Reload failed: ${e.message}\n`); }
+        tui.appendOutput({ type: 'system', text: `♻️  Reloaded plugins: ${pluginResources.plugins.length ? pluginResources.plugins.map(p => p.name).join(', ') : 'none'}` });
+      } catch (e: any) { tui.appendOutput({ type: 'error', text: `Reload failed: ${e.message}` }); }
       return;
     }
 
     if (cmd === '/help') {
-      console.log('\n\x1b[1m💡 Maestro Commands\x1b[0m');
-      console.log(''); console.log('\x1b[36mMain Agent\x1b[0m');
-      console.log('   <task>               Run task in main chat (foreground)');
-      console.log('   @<agent> <task>      Tag agent, run in foreground');
-      console.log('   @<agent>/bg <task>   Tag agent, run in background');
-      console.log(''); console.log('\x1b[36mBackground Tasks\x1b[0m');
-      console.log('   /bg <prompt>         Submit task to background queue');
-      console.log('   /tasks               List all background tasks (status, timing)');
-      console.log('   /view <id>           Show conversation, result, or pending approvals');
-      console.log('   /attach <id>         Switch focus to a running background task');
-      console.log('   /detach              Return to main agent from attached task');
-      console.log('   /send <id> <input>   Send input / approve (y/n) to waiting task');
-      console.log('   /cancel <id>         Cancel a running background task');
-      console.log(''); console.log('\x1b[36mAgents\x1b[0m');
-      console.log('   /agents              List available agent presets');
-      console.log('   /assign <a> <task>   Assign task to agent (foreground)');
-      console.log('   /assign-bg <a> <t>   Assign task to agent in background');
-      console.log(''); console.log('\x1b[36mSystem\x1b[0m');
-      console.log('   /reload              Reload plugins and skills without restart');
-      console.log('   exit                 Exit Maestro (or press Ctrl+C twice)\n');
+      tui.appendOutput({ type: 'system', text: '\x1b[1m💡 Maestro Commands\x1b[0m' });
+      tui.appendOutput({ type: 'system', text: '' });
+      tui.appendOutput({ type: 'system', text: '\x1b[36mMain Agent\x1b[0m   <task>  or  @<agent> <task>  or  @<agent>/bg <task>' });
+      tui.appendOutput({ type: 'system', text: '\x1b[36mBackground\x1b[0m   /bg  /tasks  /view <id>  /attach <id>  /detach  /send <id>  /cancel <id>' });
+      tui.appendOutput({ type: 'system', text: '\x1b[36mAgents\x1b[0m      /agents  /assign <a> <t>  /assign-bg <a> <t>' });
+      tui.appendOutput({ type: 'system', text: '\x1b[36mSystem\x1b[0m      /reload  exit' });
       return;
     }
 
-    // Unknown slash command
-    console.log(`\x1b[33m⚠️  Unknown command: ${cmd}. Try /help\x1b[0m\n`);
+    tui.appendOutput({ type: 'error', text: `Unknown command: ${cmd}. Try /help` });
     return;
   }
 
@@ -368,6 +379,8 @@ async function processLine(line: string): Promise<void> {
     const asyncFlag = tagMatch[2];
     const task = tagMatch[3]!;
     const background = asyncFlag === 'bg' || asyncFlag === 'async';
+    tui.appendOutput({ type: 'system', text: `👤 @${agentName} ${background ? '(bg)' : ''}...` });
+    tui.setRunning(true);
     const result = await spawnAgent({
       agentName, task, async: background,
       agentDefs: agentDefsGlobal, allTools: allToolsGlobal,
@@ -377,387 +390,47 @@ async function processLine(line: string): Promise<void> {
       onApprove: background ? createBgApprovalHandler('pending') : approvalHandler || undefined,
       taskRunner,
     });
-    if (background) { console.log(`\n🚀 Assigned task to @${agentName} in background: ${result}\n`); }
-    else { console.log(`\n📋 @${agentName} Result:\n${result}\n`); }
+    tui.setRunning(false);
+    if (background) { tui.appendOutput({ type: 'result', text: `🚀 @${agentName} bg: ${result}` }); }
+    else { tui.appendOutput({ type: 'result', text: result }); }
     return;
   }
 
   // ── Main agent foreground execution ───────────────────────────────────────
-  const mainId = currentState!.id;
-  let timerHandle: ReturnType<typeof setInterval> | null = null;
-  let lastAction = '';
+  tui.appendOutput({ type: 'system', text: '' });
+  tui.setRunning(true);
+  const startTime = Date.now();
   const spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   let frameIdx = 0;
-  let startTime = Date.now();
+  let timerHandle: ReturnType<typeof setInterval> | null = null;
 
-  const renderStatus = () => {
-    const frame = spinnerFrames[frameIdx % spinnerFrames.length];
-    frameIdx++;
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    const action = lastAction ? ` \x1b[90m⚡${lastAction.slice(0, 60)}\x1b[0m` : '';
-    process.stdout.write(`\r\x1b[K\x1b[36m${frame}\x1b[0m \x1b[90m${elapsed}s${action}\x1b[0m`);
-  };
-
-  /** Log a line ABOVE the status line during execution. */
-  const logDuringExec = (msg: string) => {
-    process.stdout.write(`\r\x1b[K${msg}\n`);
-    renderStatus();
-  };
-
-  const onOutput = (data: { taskId: string; role: string; content: string }) => {
-    if (data.taskId !== mainId) return;
-    if (data.role === 'tool') {
-      lastAction = data.content.slice(0, 60);
-      logDuringExec(`  \x1b[90m⚡ ${lastAction}\x1b[0m`);
-    }
-  };
-
+  // Subscribe to tool call events for live streaming
   const onLog = (data: { taskId: string; message: string }) => {
-    if (data.taskId !== mainId) return;
-    logDuringExec(`  \x1b[90m${data.message}\x1b[0m`);
+    if (data.taskId !== currentState?.id) return;
+    tui.appendOutput({ type: 'tool', text: data.message });
   };
-
-  timerHandle = setInterval(renderStatus, 100);
-  renderStatus();
-  taskRunner.on('task:output', onOutput);
   taskRunner.on('task:log', onLog);
 
   try {
     const { result, state } = await runAgent(currentState, trimmed);
     currentState = state;
-    if (timerHandle) clearInterval(timerHandle);
     const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-    // Replace status line with Done indicator
-    process.stdout.write(`\r\x1b[K\x1b[32m✔ Done\x1b[0m \x1b[90m(${totalTime}s)\x1b[0m\n`);
-    console.log(`\n📋 Result:\n${result}\n`);
+    tui.appendOutput({ type: 'system', text: `✔ Done (${totalTime}s)` });
+    tui.appendOutput({ type: 'result', text: result });
   } catch (e: any) {
-    if (timerHandle) clearInterval(timerHandle);
     const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-    process.stdout.write(`\r\x1b[K\x1b[31m✖ Failed\x1b[0m \x1b[90m(${totalTime}s)\x1b[0m\n`);
-    console.error(`\n❌ Error: ${e.message}\n`);
+    tui.appendOutput({ type: 'error', text: `✖ Failed (${totalTime}s): ${e.message}` });
   } finally {
-    taskRunner.off('task:output', onOutput);
     taskRunner.off('task:log', onLog);
+    tui.setRunning(false);
   }
 }
 
-// ── Queued input processing ─────────────────────────────────────────────────
-// After processLine completes, check if there's queued input and process it.
-async function processLineWithQueue(line: string): Promise<void> {
-  replBusy = true;
-  try {
-    await processLine(line);
-  } finally {
-    replBusy = false;
-
-    // Process next queued item (if any)
-    if (inputQueue.length > 0) {
-      const next = inputQueue.shift()!;
-      printAbove(`\x1b[90m▶ Processing queued input (${inputQueue.length} remaining)\x1b[0m`);
-      // Recursively process queued items
-      setImmediate(() => processLineWithQueue(next));
-    } else {
-      rl.prompt();
-    }
-  }
-}
-
-// ── Event-driven REPL ──────────────────────────────────────────────────────
-// Every line from the user goes through this handler.
-// If the agent is busy, input is queued and shown with a 📥 indicator.
-rl.on('line', (line: string) => {
-  // If rl.question() is active, skip — it handles the line itself
-  if (inApprovalPrompt) {
-    inApprovalPrompt = false;
-    return;
-  }
-
-  const trimmed = line.trimEnd();
-  if (!trimmed) { rl.prompt(); return; }
-
-  if (replBusy) {
-    inputQueue.push(trimmed);
-    printAbove(`\x1b[90m📥 Queued (${inputQueue.length})\x1b[0m`);
-    rl.prompt();
-    return;
-  }
-
-  processLineWithQueue(trimmed);
-});
-
-// ─── Ctrl+C: double-press to exit ────────────────────────────────────────────
-// Fix: On Windows, readline in TTY mode intercepts Ctrl+C and emits
-// rl.on('SIGINT') INSTEAD of process.on('SIGINT'). Must listen on BOTH.
-// A 100ms debounce ensures both paths never double-count the same keypress.
-
-let sigintCount = 0;
-let sigintTimer: ReturnType<typeof setTimeout> | null = null;
-let lastSigintMs = 0;
-
-function handleSigint() {
-  const now = Date.now();
-  if (now - lastSigintMs < 150) return; // debounce: one signal per 150ms
-  lastSigintMs = now;
-
-  sigintCount++;
-  if (sigintCount === 1) {
-    printAbove('\n\x1b[33m⚠️  Press Ctrl+C again within 2s to exit. Press Enter to keep going.\x1b[0m\n');
-    if (sigintTimer) clearTimeout(sigintTimer);
-    sigintTimer = setTimeout(() => { sigintCount = 0; sigintTimer = null; }, 2000);
-  } else {
-    if (sigintTimer) clearTimeout(sigintTimer);
-    shutdown().finally(() => process.exit(0));
-  }
-}
-
-// rl.on('SIGINT') fires on Windows when readline handles Ctrl+C in raw mode
-rl.on('SIGINT', handleSigint);
-// process.on('SIGINT') fires on Linux/macOS and some Windows configs
-process.on('SIGINT', handleSigint);
-process.on('SIGTERM', () => shutdown().finally(() => process.exit(0)));
-
-// ─── Background Task Notification Bus ────────────────────────────────────────
-// Route ALL background task events through printAbove() so they
-// appear above the prompt as status banners, not interleaved with main output.
-
-function bgTag(taskId: string, agentName: string): string {
-  return `\x1b[90m[bg:${taskId.slice(0, 6)} @${agentName}]\x1b[0m`;
-}
-
-taskRunner.on('started', (task: TaskRecord) => {
-  printAbove(`${bgTag(task.id, task.agentName)} \x1b[36m▶ Started\x1b[0m`);
-});
-
-taskRunner.on('completed', (task: TaskRecord) => {
-  const dur = task.completedAt && task.startedAt
-    ? ` (${((task.completedAt - task.startedAt) / 1000).toFixed(1)}s)`
-    : '';
-  printAbove(`${bgTag(task.id, task.agentName)} \x1b[32m✓ Completed${dur} — /view ${task.id}\x1b[0m`);
-});
-
-taskRunner.on('failed', (task: TaskRecord) => {
-  const short = task.error?.slice(0, 80) ?? 'unknown error';
-  printAbove(`${bgTag(task.id, task.agentName)} \x1b[31m✗ Failed: ${short}\x1b[0m`);
-});
-
-taskRunner.on('cancelled', (task: TaskRecord) => {
-  printAbove(`${bgTag(task.id, task.agentName)} \x1b[33m⊘ Cancelled\x1b[0m`);
-});
-
-// Approval gate banners 
-taskRunner.on('task:waiting', (data: { taskId: string; prompt: string }) => {
-  const task = taskRunner.getTask(data.taskId);
-  const name = task?.agentName ?? 'agent';
-  printAbove(`\n\x1b[43m\x1b[30m 🔒 ACTION REQUIRED \x1b[0m ${bgTag(data.taskId, name)}`);
-  printAbove(`\x1b[33m   ${data.prompt}\x1b[0m`);
-  printAbove(`\x1b[90m   Approve: /send ${data.taskId} y    Deny: /send ${data.taskId} n\x1b[0m\n`);
-});
-
-// Suppress noisy mid-run output by default; use /attach or /view for details.
-// Only show the final result when completed.
-taskRunner.on('task:output', (data: { taskId: string; role: string; content: string }) => {
-  if (attachedTaskId === data.taskId) {
-    // If the user is attached to this task, show output directly
-    const prefix = data.role === 'assistant' ? '🤖' : data.role === 'tool' ? '🔧' : '📋';
-    printAbove(`   ${prefix} ${data.content.slice(0, 300)}`);
-  }
-});
-
-// ─── Per-task Approval Handler (for background agents) ───────────────────────
-// Background agents use waitForInput instead of blocking main readline.
-// Approval request shows as a banner; user resolves via /send <id> y/n.
-
-function createBgApprovalHandler(taskId: string) {
-  return async (tool: string, args: any, risk: string): Promise<boolean> => {
-    if (isAutoApprovable(tool, args)) return true;
-    if (AUTO_APPROVE.includes(risk) || AUTO_APPROVE.includes('all')) return true;
-
-    const question = `🔒 APPROVAL [${tool}] risk:${risk.toUpperCase()} args:${JSON.stringify(args).slice(0, 120)}`;
-    const answer = await taskRunner.waitForInput(taskId, question);
-    return answer.trim().toLowerCase() === 'y';
-  };
-}
-
-// ─── Main Bootstrap ───────────────────────────────────────────────────────────
-
-async function main() {
-  if (!LLM_API_KEY) {
-    console.error('❌ LLM_API_KEY is required. Set it in .env');
-    process.exit(1);
-  }
-
-  const memory = await createMemory(TURSO_URL, TURSO_TOKEN);
-  const llm = createLLM({
-    apiKey: LLM_API_KEY,
-    model: LLM_MODEL,
-    baseURL: LLM_BASE_URL,
-    siteUrl: SITE_URL,
-    siteName: SITE_NAME,
-  });
-
-  const skills = await loadSkills(join(__dirname, 'skills'));
-  const agentDefs = await loadAgents(join(__dirname, 'agents'));
-  const pluginResources = await loadPluginResources({ workspaceRoot: process.cwd(), homeDir: process.env.HOME || process.env.USERPROFILE });
-  const pluginSkills = pluginResources.skills;
-  const pluginAgents = pluginResources.agents;
-  const pluginTools = pluginResources.tools;
-  const sreDef = agentDefs.find(a => a.name === 'sre');
-
-  const baseTools: Tool[] = [execTool, readFileTool, writeFileTool, webFetchTool, thinkTool, waitForInputTool];
-  const allTools: Tool[] = [...baseTools, ...k8sTools, ...dockerTools, ...linuxTools, ...pluginTools];
-
-  if (MCP_COMMAND) {
-    try {
-      const mcpArgs = process.env.MCP_ARGS?.split(' ') || [];
-      const mcp = await connectMCP(MCP_COMMAND, mcpArgs);
-      allTools.push(...mcp.tools);
-      mcpCleanup = mcp.close;
-      console.log(`🔗 MCP connected: ${mcp.tools.length} tools`);
-    } catch (e: any) {
-      console.warn(`⚠️ MCP failed: ${e.message}`);
-    }
-  }
-
-  allTools.push(createSpawnTool([...agentDefs, ...pluginAgents], allTools));
-
-  agentDefsGlobal = [...agentDefs, ...pluginAgents];
-  allToolsGlobal = allTools;
-
-  // Main agent's approval handler — uses the main readline synchronously
-  approvalHandler = async (tool: string, args: any, risk: string): Promise<boolean> => {
-    if (isAutoApprovable(tool, args)) return true;
-    if (AUTO_APPROVE.includes(risk) || AUTO_APPROVE.includes('all')) return true;
-
-    console.log(`\n\x1b[41m\x1b[37m 🔒 APPROVAL REQUIRED \x1b[0m`);
-    console.log(`\x1b[33m   Tool:\x1b[0m  ${tool}`);
-    console.log(`\x1b[33m   Risk:\x1b[0m  ${risk.toUpperCase()}`);
-    console.log(`\x1b[33m   Args:\x1b[0m  ${JSON.stringify(args)}`);
-    console.log(`\x1b[90m   Type 'y' and press Enter to approve. Anything else denies.\x1b[0m\n`);
-
-    const answer = await ask('   Approve? (y/n): ');
-    return answer.trim().toLowerCase() === 'y';
-  };
-
-  currentState = createAgentState({
-    id: 'main',
-    name: 'sre-agent',
-    systemPrompt: sreDef?.systemPrompt || 'You are an SRE agent.',
-    tools: allTools,
-    llm,
-    memory,
-    skills: [...skills, ...pluginSkills],
-    maxIterations: 50,
-    onApprove: approvalHandler || undefined,
-    taskRunner,
-  });
-
-  console.log('🚀 SRE Agent ready.');
-  console.log(`   Skills: ${skills.length + pluginSkills.length} | Agents: ${agentDefs.length + pluginAgents.length} | Tools: ${allTools.length}`);
-  if (pluginResources.plugins.length) {
-    console.log(`   Plugins: ${pluginResources.plugins.map(p => p.name).join(', ')}`);
-  }
-  console.log(`   LLM: ${LLM_MODEL} via OpenRouter`);
-  console.log('   Type a task, @agent/bg <task>, /help, or "exit"\n');
-
-  await runRepl();
-  await shutdown();
-}
-
-// ─── Attach to a Background Task ──────────────────────────────────────────────
-
-async function attachToTask(taskId: string) {
-  const task = taskRunner.getTask(taskId);
-  if (!task) {
-    console.log(`❌ Task [${taskId}] not found.\n`);
-    return;
-  }
-
-  attachedTaskId = taskId;
-
-  console.log(`\n🔗 Attached to task [${taskId}] (@${task.agentName}).`);
-  console.log(`   Status: ${task.status.toUpperCase()}`);
-  console.log(`   Prompt: ${task.taskPrompt}`);
-  console.log(`   Type 'detach' to leave, or send input to a waiting task.\n`);
-
-  if (task.messages.length > 0) {
-    console.log('── Conversation ──');
-    for (const msg of task.messages) {
-      if (msg.role === 'system') continue;
-      const prefix = msg.role === 'user' ? '🧑' : msg.role === 'assistant' ? '🤖' : msg.role === 'tool' ? '🔧' : '❓';
-      const content = msg.content?.slice(0, 300) ?? '';
-      if (content) console.log(`   ${prefix} ${content}`);
-    }
-    console.log('');
-  }
-
-  if (task.waitingForInput && task.waitingPrompt) {
-    console.log(`⏸️  Task is waiting for input:`);
-    console.log(`   ${task.waitingPrompt}\n`);
-  }
-
-  // While attached: stream all output to the terminal via printAbove
-  const onOutput = (data: { taskId: string; role: string; content: string }) => {
-    if (data.taskId !== taskId) return;
-    const prefix = data.role === 'assistant' ? '🤖' : data.role === 'tool' ? '🔧' : data.role === 'result' ? '📋' : '❓';
-    printAbove(`   ${prefix} ${data.content.slice(0, 300)}`);
-  };
-  const onLog = (data: { taskId: string; message: string }) => {
-    if (data.taskId !== taskId) return;
-    printAbove(`   📝 ${data.message}`);
-  };
-
-  taskRunner.on('task:output', onOutput);
-  taskRunner.on('task:log', onLog);
-
-  try {
-    while (attachedTaskId === taskId) {
-      const currentPrompt = `task-${taskId.slice(0, 6)}> `;
-      const input = await ask(currentPrompt);
-      const trimmed = input.trim();
-
-      if (trimmed === 'detach' || trimmed === 'exit' || trimmed === 'quit') {
-        console.log(`\n🔓 Detached from task [${taskId}]. Task continues in background.\n`);
-        attachedTaskId = null;
-        break;
-      }
-
-      if (!trimmed) continue;
-
-      const currentTask = taskRunner.getTask(taskId);
-      if (!currentTask) {
-        console.log('❌ Task no longer exists.\n');
-        break;
-      }
-
-      if (currentTask.waitingForInput) {
-        const ok = taskRunner.sendInput(taskId, trimmed);
-        if (ok) {
-          console.log(`   📤 Sent: ${trimmed}\n`);
-        } else {
-          console.log('❌ Could not send input.\n');
-        }
-      } else if (currentTask.status === 'completed' || currentTask.status === 'failed') {
-        console.log('⚠️  Task is already finished. Type "detach" and use /view to see results.\n');
-      } else {
-        console.log('   (Task is running — it will accept input when it pauses)\n');
-      }
-    }
-  } finally {
-    taskRunner.off('task:output', onOutput);
-    taskRunner.off('task:log', onLog);
-    // Restore main prompt
-    rl.setPrompt('> ');
-  }
-}
-
-// ─── Main REPL (event-driven) ───────────────────────────────────────────────
-// Called once from main(). Shows the initial prompt; all further input is
-// handled by rl.on('line') above.
+// ─── Main REPL ───────────────────────────────────────────────────────────────
 
 async function runRepl() {
-  rl.prompt();
-  // Wait indefinitely (Ctrl+C or exit/quit shuts down)
-  await new Promise<void>(() => {});
+  // Only used as a fallback; TUI handles input via 'submit' events
+  await new Promise<void>(() => { });
 }
 
 // ─── Shutdown ─────────────────────────────────────────────────────────────────
@@ -767,7 +440,7 @@ async function shutdown() {
     await mcpCleanup();
     mcpCleanup = null;
   }
-  rl.close();
+  tui.stop();
 }
 
 main().catch(async (err) => {

@@ -184,12 +184,6 @@ Please adhere to the existing code style (ES2022, strict types) and keep changes
 
 ---
 
-## 📄 License
-
-MIT © 2024‑2025 Your Organization
-
----
-
 ### TL;DR – Command cheat‑sheet
 
 | Command | Example |
@@ -204,4 +198,3 @@ MIT © 2024‑2025 Your Organization
 | `/assign @sre status` | Directly invoke an agent |
 | `@linux-expert/logs` | Tag agent in main prompt |
 
-Enjoy Maestro – the OpenRouter‑powered REPL for reliable, interactive agent work!

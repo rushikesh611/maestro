@@ -96,31 +96,22 @@ export const waitForInputTool: Tool = {
 
         // Show the question to the user
         process.stdout.write(`\n\x1b[43m\x1b[30m ⏸️  WAITING \x1b[0m ${args.question}\n`);
-        process.stdout.write(`\x1b[90m   (Type your response below, or /send <task-id> for bg tasks)\x1b[0m\n\n`);
+        process.stdout.write(`\x1b[90m   (Type your response below)\x1b[0m\n\n`);
 
         const tr = ctx.taskRunner as any;
 
-        // Start the event-based wait (works for background tasks via /send)
-        const bgPromise = ctx.taskRunner.waitForInput(ctx.agentId, args.question);
-
         if (tr.isSyncAgent?.(ctx.agentId) || ctx.agentId === 'main') {
             // ── Sync / foreground agent — REPL is blocked ─────────────────
-            // Prompt directly so the user can respond inline.
-            const { createInterface } = await import('readline');
-            const rli = createInterface({ input: process.stdin, output: process.stdout });
-            const input = await new Promise<string>((resolve) => {
-                rli.question('> ', (answer: string) => {
-                    rli.close();
-                    resolve(answer);
-                });
-            });
-            // Also resolve the bg promise (for cleanup / status tracking)
-            tr.sendInput?.(ctx.agentId, input);
-            return `User responded: ${input}`;
+            // Use the main REPL's ask() via promptUser — no second readline created
+            if (tr.promptUser) {
+                const input = await tr.promptUser('> ');
+                tr.sendInput?.(ctx.agentId, input);
+                return `User responded: ${input}`;
+            }
+            return 'No prompt handler available.';
         } else {
             // ── Background task — main REPL is still live ─────────────────
-            // User will use /send <task-id> to respond.
-            const input = await bgPromise;
+            const input = await tr.waitForInput(ctx.agentId, args.question);
             return `User responded: ${input}`;
         }
     },

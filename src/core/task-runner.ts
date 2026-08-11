@@ -50,6 +50,12 @@ export class TaskRunner extends EventEmitter {
   private syncAgents = new Set<string>();
 
   /**
+   * Callback for prompting the user during sync agent execution.
+   * Set by the main REPL's `ask` function; avoids creating duplicate readline interfaces.
+   */
+  promptUser: ((question: string) => Promise<string>) | null = null;
+
+  /**
    * Submits a task to run asynchronously in the background.
    * Immediately returns the created TaskRecord.
    */

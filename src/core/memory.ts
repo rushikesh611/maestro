@@ -64,7 +64,23 @@ export async function createMemory(url: string, authToken?: string): Promise<Mem
       // FTS MATCH query syntax issue fallback
     }
 
-    // Fallback: literal SQL LIKE substring search
+    // Fallback: SQL LIKE search across individual words (not the whole phrase)
+    const words = query.trim().split(/\s+/).filter(w => w.length > 2);
+    if (words.length > 0) {
+      const conditions = words.map(() => `content LIKE ?`);
+      const likeArgs: any[] = [agentId, ...words.map(w => `%${w}%`)];
+      let fallbackSql = `SELECT * FROM memory WHERE agent_id = ? AND (${conditions.join(' OR ')})`;
+      if (type) { fallbackSql += ` AND type = ?`; likeArgs.push(type); }
+      fallbackSql += ` ORDER BY created_at DESC LIMIT ?`;
+      likeArgs.push(limit);
+
+      try {
+        const rows = (await db.execute({ sql: fallbackSql, args: likeArgs })).rows as unknown as MemoryEntry[];
+        if (rows.length > 0) return rows;
+      } catch { /* individual-word fallback failed */ }
+    }
+
+    // Second fallback: whole-phrase LIKE search
     let fallbackSql = `SELECT * FROM memory WHERE agent_id = ? AND content LIKE ?`;
     const fallbackArgs: any[] = [agentId, `%${query.trim()}%`];
     if (type) { fallbackSql += ` AND type = ?`; fallbackArgs.push(type); }
