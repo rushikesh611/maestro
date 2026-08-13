@@ -139,11 +139,28 @@ export async function runAgent(state: AgentState, task: string): Promise<{ resul
             try {
                 const args = JSON.parse(call.function.arguments);
 
+                // Live event streaming for plans and tool calls
+                if (call.function.name === 'think') {
+                    state.taskRunner?.emit('task:output', {
+                        taskId: state.id,
+                        role: 'plan',
+                        content: `🧠 Plan: ${args.reasoning}`
+                    });
+                } else {
+                    const argStr = JSON.stringify(args);
+                    state.taskRunner?.emit('task:output', {
+                        taskId: state.id,
+                        role: 'tool_call',
+                        content: `⚡ Tool ${call.function.name}(${argStr.slice(0, 150)})`
+                    });
+                }
+
                 if (tool && tool.risk !== 'read' && state.onApprove) {
                     const approved = await state.onApprove(tool.name, args, tool.risk);
                     if (!approved) {
                         result = `User denied approval for ${tool.name}.`;
                         messages = [...messages, { role: 'tool', content: result, tool_call_id: call.id }];
+                        state.taskRunner?.emit('task:output', { taskId: state.id, role: 'tool', content: `⛔ Denied ${tool.name}` });
                         continue;
                     }
                 }
@@ -174,8 +191,14 @@ export async function runAgent(state: AgentState, task: string): Promise<{ resul
                 type: 'conversation',
                 content: `Tool ${call.function.name}: ${truncatedResult.slice(0, 2000)}`,
             });
-            // Emit tool result for live streaming
-            state.taskRunner?.emit('task:output', { taskId: state.id, role: 'tool', content: `${call.function.name}: ${truncatedResult.slice(0, 500)}` });
+            // Emit tool result for live streaming (except think tool which emits plan)
+            if (call.function.name !== 'think') {
+                state.taskRunner?.emit('task:output', {
+                    taskId: state.id,
+                    role: 'tool',
+                    content: `📋 Result (${call.function.name}): ${truncatedResult.slice(0, 250)}`
+                });
+            }
         }
     }
 

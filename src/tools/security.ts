@@ -40,6 +40,24 @@ const READ_VERBS: Record<string, string[]> = {
     'env',
     'search',
   ],
+  exec: [
+    'which',
+    'where',
+    'pwd',
+    'whoami',
+    'echo',
+    'hostname',
+    'uname',
+    'uptime',
+    'date',
+    'ls',
+    'dir',
+    'cat',
+    'head',
+    'tail',
+    'grep',
+    'find',
+  ],
 };
 
 // Regex matching dangerous shell syntax operators that allow command chaining, redirection, or subshells
@@ -51,7 +69,11 @@ const DANGEROUS_OPERATORS_REGEX = /(?:[;&|<>`]|\$\(|\$\{)/;
 export function hasDangerousOperators(command: string): boolean {
   if (!command) return false;
   if (/[\r\n]/.test(command)) return true;
-  return DANGEROUS_OPERATORS_REGEX.test(command);
+  // Allow safe stdio redirects like 2>&1 or safe pipes to head/tail/grep/wc
+  const sanitized = command
+    .replace(/2>&1/g, '')
+    .replace(/\|\s*(?:head|tail|grep|wc|sort|uniq|less|more|cat)\b[^\r\n;&|<>`]*/gi, '');
+  return DANGEROUS_OPERATORS_REGEX.test(sanitized);
 }
 
 /**
@@ -106,19 +128,34 @@ export function extractSubcommandVerb(command: string): string | null {
  * Evaluates whether a tool invocation is safe for auto-approval.
  */
 export function isAutoApprovable(tool: string, args: Record<string, any>): boolean {
-  const toolName = tool.toLowerCase();
-  const validVerbs = READ_VERBS[toolName];
-  if (!validVerbs) return false;
-
   const command = (args?.command || args?.cmd || '') as string;
   if (!command || typeof command !== 'string') return false;
 
-  // Disallow any command with chaining, redirection, or subshells
+  // Disallow dangerous operators
   if (hasDangerousOperators(command)) {
     return false;
   }
 
-  // Extract subcommand verb skipping options
+  const toolName = tool.toLowerCase();
+
+  // If tool is exec, check if it starts with docker, kubectl, helm or a safe exec verb
+  if (toolName === 'exec') {
+    const verb = extractSubcommandVerb(command)?.toLowerCase();
+    if (!verb) return false;
+
+    if (READ_VERBS.exec?.includes(verb)) return true;
+
+    if (verb === 'docker' || verb === 'kubectl' || verb === 'helm') {
+      const rest = command.slice(command.indexOf(verb) + verb.length);
+      const subVerb = extractSubcommandVerb(rest)?.toLowerCase();
+      if (subVerb && READ_VERBS[verb]?.includes(subVerb)) return true;
+    }
+    return false;
+  }
+
+  const validVerbs = READ_VERBS[toolName];
+  if (!validVerbs) return false;
+
   const verb = extractSubcommandVerb(command);
   if (!verb) return false;
 

@@ -94,10 +94,6 @@ export const waitForInputTool: Tool = {
             return 'No task runner available — cannot wait for input.';
         }
 
-        // Show the question to the user
-        process.stdout.write(`\n\x1b[43m\x1b[30m ⏸️  WAITING \x1b[0m ${args.question}\n`);
-        process.stdout.write(`\x1b[90m   (Type your response below)\x1b[0m\n\n`);
-
         const tr = ctx.taskRunner as any;
 
         if (tr.isSyncAgent?.(ctx.agentId) || ctx.agentId === 'main') {

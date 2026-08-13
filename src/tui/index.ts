@@ -120,9 +120,24 @@ export class TUI extends EventEmitter {
     this.tui.start();
     this.tui.setFocus(this.editor);
 
-    // Ctrl+C to exit
+    // Ctrl+C: require two presses within 2 seconds to exit
+    let sigintCount = 0;
+    let sigintTimer: ReturnType<typeof setTimeout> | null = null;
+
     this.tui.addInputListener((data: string) => {
-      if (data === '\x03') { this.stop(); process.exit(0); }
+      if (data === '\x03') {
+        sigintCount++;
+        if (sigintCount === 1) {
+          this.appendOutput({ type: 'system', text: '\x1b[33m⚠️  Press Ctrl+C again within 2s to exit.\x1b[0m' });
+          if (sigintTimer) clearTimeout(sigintTimer);
+          sigintTimer = setTimeout(() => { sigintCount = 0; sigintTimer = null; }, 2000);
+        } else {
+          if (sigintTimer) clearTimeout(sigintTimer);
+          this.stop();
+          process.exit(0);
+        }
+        return { consume: true };
+      }
       return { consume: false };
     });
 
@@ -204,11 +219,16 @@ export class TUI extends EventEmitter {
     return new Promise(resolve => {
       const remove = this.tui.addInputListener((data: string) => {
         const ch = data.toLowerCase().trim();
-        if (ch === 'y' || ch === '\r' || ch === '\n') {
+        if (ch.startsWith('/')) {
+          // Slash command typed during confirm — release prompt lock and pass command to editor
+          remove(); this.promptActive = false; resolve(false);
+          return { consume: false };
+        }
+        if (ch === 'y' || ch === '\r' || ch === '\n' || ch === 'yes') {
           remove(); this.promptActive = false; resolve(true);
           return { consume: true };
         }
-        if (ch === 'n' || ch === '\x1b') {
+        if (ch === 'n' || ch === '\x1b' || ch === 'no') {
           remove(); this.promptActive = false; resolve(false);
           return { consume: true };
         }

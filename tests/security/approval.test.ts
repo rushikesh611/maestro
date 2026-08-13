@@ -85,8 +85,9 @@ describe('Security Approval Guard (Task 1.1)', () => {
       expect(isAutoApprovable('kubectl', { command: 'get pods > pods.txt' })).toBe(false);
     });
 
-    test('rejects unrecognised tools or empty commands', () => {
-      expect(isAutoApprovable('exec', { command: 'ls -la' })).toBe(false);
+    test('auto-approves safe read-only exec commands and rejects unrecognised tools or empty commands', () => {
+      expect(isAutoApprovable('exec', { command: 'ls -la' })).toBe(true);
+      expect(isAutoApprovable('exec', { command: 'rm -rf /' })).toBe(false);
       expect(isAutoApprovable('kubectl', { command: '' })).toBe(false);
       expect(isAutoApprovable('unknown_tool', { command: 'get' })).toBe(false);
     });

@@ -1,6 +1,7 @@
 import * as readline from 'readline';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { randomUUID } from 'crypto';
 import { createLLM } from './core/llm';
 import { createMemory } from './core/memory';
 import { createAgentState, runAgent } from './core/agent';
@@ -129,12 +130,12 @@ taskRunner.on('task:output', (data: { taskId: string; role: string; content: str
 
 // ─── Per-task Approval Handler (for background agents) ───────────────────────
 
-function createBgApprovalHandler(taskId: string) {
+function createBgApprovalHandler(taskRunner: TaskRunner, agentId: string) {
   return async (tool: string, args: any, risk: string): Promise<boolean> => {
     if (isAutoApprovable(tool, args)) return true;
     if (AUTO_APPROVE.includes(risk) || AUTO_APPROVE.includes('all')) return true;
-    const question = `🔒 APPROVAL [${tool}] risk:${risk.toUpperCase()} args:${JSON.stringify(args).slice(0, 120)}`;
-    const answer = await taskRunner.waitForInput(taskId, question);
+    const question = `Approve ${tool}? risk:${risk.toUpperCase()} args:${JSON.stringify(args).slice(0, 120)}`;
+    const answer = await taskRunner.waitForInput(agentId, question);
     return answer.trim().toLowerCase() === 'y';
   };
 }
@@ -219,10 +220,68 @@ async function main() {
   tui.start();
 }
 
+function renderTaskDetails(task: TaskRecord) {
+  const dur = task.completedAt
+    ? `${((task.completedAt - task.createdAt) / 1000).toFixed(1)}s`
+    : task.startedAt ? `${((Date.now() - task.startedAt) / 1000).toFixed(1)}s running...` : 'queued';
+
+  tui.appendOutput({ type: 'system', text: `📋 Task [${task.id}]  Status: ${task.status.toUpperCase()} (${dur})` });
+  tui.appendOutput({ type: 'system', text: `   Agent: @${task.agentName} | Prompt: ${task.taskPrompt}` });
+
+  if (task.messages.length > 0) {
+    tui.appendOutput({ type: 'system', text: '── Task Activity & Conversation ──' });
+    for (const msg of task.messages) {
+      if (msg.role === 'system') continue;
+      const prefix = msg.role === 'user' ? '🧑 User:' : msg.role === 'assistant' ? '🤖 Assistant:' : '🔧 Tool:';
+      if (msg.content) {
+        tui.appendOutput({ type: 'tool', text: `${prefix} ${msg.content.slice(0, 800)}` });
+      }
+      if (msg.tool_calls) {
+        for (const tc of msg.tool_calls) {
+          if (tc.function.name === 'think') {
+            try {
+              const parsed = JSON.parse(tc.function.arguments);
+              tui.appendOutput({ type: 'tool', text: `🧠 Plan: ${parsed.reasoning}` });
+            } catch {
+              tui.appendOutput({ type: 'tool', text: `🧠 Plan: ${tc.function.arguments}` });
+            }
+          } else {
+            tui.appendOutput({ type: 'tool', text: `⚡ Executed: ${tc.function.name}(${tc.function.arguments.slice(0, 150)})` });
+          }
+        }
+      }
+    }
+  }
+
+  if (task.waitingForInput && task.waitingPrompt) {
+    tui.appendOutput({ type: 'system', text: `⏸️  Waiting for input: ${task.waitingPrompt}` });
+    tui.appendOutput({ type: 'system', text: `   (Type response below or use /send ${task.id} <input>)` });
+  }
+
+  if (task.result && task.status === 'completed') {
+    tui.appendOutput({ type: 'result', text: task.result });
+  }
+  if (task.error) {
+    tui.appendOutput({ type: 'error', text: task.error });
+  }
+}
+
 // ─── Input Router ────────────────────────────────────────────────────────────
 
 async function handleSubmit(trimmed: string) {
   if (!currentState) return;
+
+  // If attached to a task that is waiting for input, route plain text directly to the task
+  if (attachedTaskId && !trimmed.startsWith('/')) {
+    const task = taskRunner.getTask(attachedTaskId);
+    if (task && task.waitingForInput) {
+      const ok = taskRunner.sendInput(attachedTaskId, trimmed);
+      if (ok) {
+        tui.appendOutput({ type: 'system', text: `📤 Sent to attached task [${attachedTaskId}]: ${trimmed}` });
+        return;
+      }
+    }
+  }
 
   // ── Slash command router ──────────────────────────────────────────────────
   if (trimmed.startsWith('/')) {
@@ -231,7 +290,21 @@ async function handleSubmit(trimmed: string) {
 
     if (cmd === '/bg' || cmd === '/submit') {
       if (!subArg) { tui.appendOutput({ type: 'system', text: 'Usage: /bg <task prompt>' }); return; }
-      const task = taskRunner.submitTask(currentState, subArg);
+      const bgId = randomUUID();
+      const bgState = createAgentState({
+        id: bgId,
+        name: currentState.name,
+        systemPrompt: currentState.systemPrompt,
+        tools: Array.from(currentState.tools.values()),
+        llm: currentState.llm,
+        memory: currentState.memory,
+        skills: currentState.skills,
+        maxIterations: currentState.maxIterations,
+        workingDir: currentState.workingDir,
+        onApprove: createBgApprovalHandler(taskRunner, bgId),
+        taskRunner,
+      });
+      const task = taskRunner.submitTask(bgState, subArg);
       tui.appendOutput({ type: 'system', text: `🚀 Background task submitted: [${task.id}]` });
       return;
     }
@@ -253,24 +326,7 @@ async function handleSubmit(trimmed: string) {
       if (!subArg) { tui.appendOutput({ type: 'system', text: 'Usage: /view <task-id>' }); return; }
       const task = taskRunner.getTask(subArg);
       if (!task) { tui.appendOutput({ type: 'error', text: `Task [${subArg}] not found.` }); return; }
-      const dur = task.completedAt
-        ? `${((task.completedAt - task.createdAt) / 1000).toFixed(1)}s`
-        : task.startedAt ? `${((Date.now() - task.startedAt) / 1000).toFixed(1)}s running...` : 'queued';
-      tui.appendOutput({ type: 'system', text: `📋 Task [${task.id}]  ${task.status.toUpperCase()}  (${dur})` });
-      tui.appendOutput({ type: 'system', text: `   Agent: @${task.agentName} | Prompt: ${task.taskPrompt}` });
-      if (task.waitingForInput && task.waitingPrompt) {
-        tui.appendOutput({ type: 'system', text: `⏸️  Waiting: ${task.waitingPrompt}` });
-        tui.appendOutput({ type: 'system', text: `   → /send ${task.id} y   or   /send ${task.id} n` });
-      }
-      if (task.messages.length > 0) {
-        for (const msg of task.messages) {
-          if (msg.role === 'system') continue;
-          const prefix = msg.role === 'user' ? '🧑' : msg.role === 'assistant' ? '🤖' : '🔧';
-          if (msg.content) tui.appendOutput({ type: 'tool', text: `${prefix} ${msg.content.slice(0, 500)}` });
-        }
-      }
-      if (task.result && task.status === 'completed') tui.appendOutput({ type: 'result', text: task.result });
-      if (task.error) tui.appendOutput({ type: 'error', text: task.error });
+      renderTaskDetails(task);
       return;
     }
 
@@ -289,6 +345,7 @@ async function handleSubmit(trimmed: string) {
       if (!task) { tui.appendOutput({ type: 'error', text: `Task [${subArg}] not found.` }); return; }
       attachedTaskId = task.id;
       tui.appendOutput({ type: 'system', text: `🔗 Attached to task [${task.id}] (@${task.agentName})` });
+      renderTaskDetails(task);
       return;
     }
 
@@ -321,16 +378,17 @@ async function handleSubmit(trimmed: string) {
       const task = taskParts.join(' ');
       const background = cmd === '/assign-bg';
       tui.appendOutput({ type: 'system', text: `👤 Running @${agentName} ${background ? '(bg)' : ''}...` });
-      tui.setRunning(true);
+      if (!background) tui.setRunning(true);
       const result = await spawnAgent({
         agentName, task, async: background,
         agentDefs: agentDefsGlobal, allTools: allToolsGlobal,
         llm: currentState!.llm, memory: currentState!.memory,
         skills: currentState!.skills, parentId: currentState!.id,
-        workingDir: currentState!.workingDir, onApprove: approvalHandler || undefined,
+        workingDir: currentState!.workingDir,
+        onApprove: background ? undefined : approvalHandler || undefined,
         taskRunner,
       });
-      tui.setRunning(false);
+      if (!background) tui.setRunning(false);
       if (background) { tui.appendOutput({ type: 'result', text: `🚀 Assigned to @${agentName}: ${result}` }); }
       else { tui.appendOutput({ type: 'result', text: result }); }
       return;
@@ -380,17 +438,17 @@ async function handleSubmit(trimmed: string) {
     const task = tagMatch[3]!;
     const background = asyncFlag === 'bg' || asyncFlag === 'async';
     tui.appendOutput({ type: 'system', text: `👤 @${agentName} ${background ? '(bg)' : ''}...` });
-    tui.setRunning(true);
+    if (!background) tui.setRunning(true);
     const result = await spawnAgent({
       agentName, task, async: background,
       agentDefs: agentDefsGlobal, allTools: allToolsGlobal,
       llm: currentState!.llm, memory: currentState!.memory,
       skills: currentState!.skills, parentId: currentState!.id,
       workingDir: currentState!.workingDir,
-      onApprove: background ? createBgApprovalHandler('pending') : approvalHandler || undefined,
+      onApprove: background ? undefined : approvalHandler || undefined,
       taskRunner,
     });
-    tui.setRunning(false);
+    if (!background) tui.setRunning(false);
     if (background) { tui.appendOutput({ type: 'result', text: `🚀 @${agentName} bg: ${result}` }); }
     else { tui.appendOutput({ type: 'result', text: result }); }
     return;

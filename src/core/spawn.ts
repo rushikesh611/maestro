@@ -1,6 +1,8 @@
+import { randomUUID } from 'crypto';
 import type { AgentDef, LLM, Memory, Skill, Tool, Context } from './types';
 import { createAgentState, runAgent } from './agent';
 import type { TaskRunner } from './task-runner';
+import { isAutoApprovable } from '../tools/security';
 
 /**
  * Shared helper for spawning a specialized sub-agent by name.
@@ -30,7 +32,11 @@ export async function spawnAgent(opts: SpawnAgentOptions): Promise<string> {
         return `Agent "${opts.agentName}" not found. Available: ${available || '(none loaded)'}`;
     }
 
+    const subStateId = randomUUID();
+    const isAsync = Boolean(opts.async && opts.taskRunner);
+
     const subState = createAgentState({
+        id: subStateId,
         name: def.name,
         systemPrompt: def.systemPrompt,
         tools: opts.allTools,
@@ -39,12 +45,19 @@ export async function spawnAgent(opts: SpawnAgentOptions): Promise<string> {
         skills: opts.skills,
         parentId: opts.parentId,
         workingDir: opts.workingDir ?? process.cwd(),
-        onApprove: opts.onApprove,
+        onApprove: isAsync
+            ? async (tool: string, args: any, risk: string): Promise<boolean> => {
+                if (isAutoApprovable(tool, args)) return true;
+                const question = `Approve ${tool}? risk:${risk.toUpperCase()} args:${JSON.stringify(args).slice(0, 120)}`;
+                const answer = await opts.taskRunner!.waitForInput(subStateId, question);
+                return answer.trim().toLowerCase() === 'y';
+              }
+            : opts.onApprove,
         taskRunner: opts.taskRunner,
     });
 
-    if (opts.async && opts.taskRunner) {
-        const taskRecord = opts.taskRunner.submitTask(subState, opts.task);
+    if (isAsync) {
+        const taskRecord = opts.taskRunner!.submitTask(subState, opts.task);
         return `[Agent "${def.name}" spawned in background with Task ID: ${taskRecord.id}]`;
     }
 
