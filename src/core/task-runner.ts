@@ -135,11 +135,15 @@ export class TaskRunner extends EventEmitter {
       startedAt: Date.now(),
       logs: [],
       messages: [],
-      // Marked as sync via syncAgents Set in TaskRunner
     };
     this.tasks.set(id, record);
     this.agentToTask.set(agentState.id, id);
+    this.syncAgents.add(agentState.id);
     return record;
+  }
+
+  isSyncAgent(agentId: string): boolean {
+    return this.syncAgents.has(agentId);
   }
 
   /**

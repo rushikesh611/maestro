@@ -57,6 +57,21 @@ const READ_VERBS: Record<string, string[]> = {
     'tail',
     'grep',
     'find',
+    'aws',
+  ],
+  aws: [
+    'describe',
+    'list',
+    'get',
+    'ls',
+    'help',
+    'version',
+    'sts',
+    'ec2',
+    's3',
+    'iam',
+    'cloudwatch',
+    'logs',
   ],
 };
 
@@ -69,8 +84,10 @@ const DANGEROUS_OPERATORS_REGEX = /(?:[;&|<>`]|\$\(|\$\{)/;
 export function hasDangerousOperators(command: string): boolean {
   if (!command) return false;
   if (/[\r\n]/.test(command)) return true;
-  // Allow safe stdio redirects like 2>&1 or safe pipes to head/tail/grep/wc
+  // Allow safe stdio redirects like 2>&1, logical operators (|| &&), or safe pipes to head/tail/grep/wc
   const sanitized = command
+    .replace(/\|\|/g, '')
+    .replace(/&&/g, '')
     .replace(/2>&1/g, '')
     .replace(/\|\s*(?:head|tail|grep|wc|sort|uniq|less|more|cat)\b[^\r\n;&|<>`]*/gi, '');
   return DANGEROUS_OPERATORS_REGEX.test(sanitized);
@@ -149,6 +166,20 @@ export function isAutoApprovable(tool: string, args: Record<string, any>): boole
       const rest = command.slice(command.indexOf(verb) + verb.length);
       const subVerb = extractSubcommandVerb(rest)?.toLowerCase();
       if (subVerb && READ_VERBS[verb]?.includes(subVerb)) return true;
+    }
+    if (verb === 'aws') {
+      const rest = command.slice(command.indexOf('aws') + 3);
+      const service = extractSubcommandVerb(rest)?.toLowerCase();
+      if (!service) return false;
+      // Direct aws verbs like "aws help", "aws version"
+      if (['help', 'version'].includes(service)) return true;
+      // For aws <service> <read-action>, check READ_VERBS.aws for common read prefixes
+      const actionRest = rest.slice(rest.indexOf(service) + service.length);
+      const action = extractSubcommandVerb(actionRest)?.toLowerCase();
+      if (action) {
+        const readPrefixes = ['describe', 'list', 'get', 'help', 'version'];
+        if (readPrefixes.some(p => action === p || action.startsWith(p + '-'))) return true;
+      }
     }
     return false;
   }

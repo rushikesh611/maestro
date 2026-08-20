@@ -123,8 +123,26 @@ taskRunner.on('task:waiting', (data: { taskId: string; prompt: string }) => {
 
 taskRunner.on('task:output', (data: { taskId: string; role: string; content: string }) => {
   if (attachedTaskId === data.taskId) {
-    const prefix = data.role === 'assistant' ? '🤖' : data.role === 'tool' ? '⚡' : '📋';
+    const prefix = data.role === 'assistant' ? '🤖' : data.role === 'tool' ? '⚡' : data.role === 'plan' ? '🧠' : '📋';
     tui.appendOutput({ type: 'tool', text: `${prefix} ${data.content.slice(0, 300)}` });
+  } else if (data.role === 'plan' || data.role === 'tool_call') {
+    // Show plan/thinking from any agent
+    const task = taskRunner.getTask(data.taskId);
+    if (task) {
+      const tag = `[${task.agentName ?? 'agent'}]`;
+      const prefix = data.role === 'plan' ? '🧠' : '⚡';
+      tui.appendOutput({ type: 'tool', text: `${tag} ${prefix} ${data.content.slice(0, 250)}` });
+    } else if (data.taskId === currentState?.id) {
+      // Main agent direct run (not through TaskRunner)
+      const prefix = data.role === 'plan' ? '🧠' : '⚡';
+      tui.appendOutput({ type: 'tool', text: `${prefix} ${data.content.slice(0, 250)}` });
+    }
+  } else if (!attachedTaskId && (data.taskId === currentState?.id || data.role === 'tool')) {
+    // Show tool results and assistant messages for main agent when not attached
+    if (data.role === 'tool' || data.role === 'assistant') {
+      const prefix = data.role === 'assistant' ? '🤖' : '📋';
+      tui.appendOutput({ type: 'tool', text: `${prefix} ${data.content.slice(0, 300)}` });
+    }
   }
 });
 
@@ -134,7 +152,9 @@ function createBgApprovalHandler(taskRunner: TaskRunner, agentId: string) {
   return async (tool: string, args: any, risk: string): Promise<boolean> => {
     if (isAutoApprovable(tool, args)) return true;
     if (AUTO_APPROVE.includes(risk) || AUTO_APPROVE.includes('all')) return true;
-    const question = `Approve ${tool}? risk:${risk.toUpperCase()} args:${JSON.stringify(args).slice(0, 120)}`;
+    const argStr = JSON.stringify(args, null, 0);
+    const truncated = argStr.length > 400 ? argStr.slice(0, 397) + '...' : argStr;
+    const question = `Approve ${tool}? risk:${risk.toUpperCase()} args:${truncated}`;
     const answer = await taskRunner.waitForInput(agentId, question);
     return answer.trim().toLowerCase() === 'y';
   };
@@ -186,7 +206,9 @@ async function main() {
     if (isAutoApprovable(tool, args)) return true;
     if (AUTO_APPROVE.includes(risk) || AUTO_APPROVE.includes('all')) return true;
 
-    const question = `Approve ${tool}? risk:${risk.toUpperCase()} args:${JSON.stringify(args).slice(0, 120)}`;
+    const argStr = JSON.stringify(args, null, 0);
+    const truncated = argStr.length > 400 ? argStr.slice(0, 397) + '...' : argStr;
+    const question = `Approve ${tool}? risk:${risk.toUpperCase()} args:${truncated}`;
     return await tui.confirm(question, risk === 'dangerous');
   };
 
@@ -458,16 +480,24 @@ async function handleSubmit(trimmed: string) {
   tui.appendOutput({ type: 'system', text: '' });
   tui.setRunning(true);
   const startTime = Date.now();
-  const spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-  let frameIdx = 0;
-  let timerHandle: ReturnType<typeof setInterval> | null = null;
 
   // Subscribe to tool call events for live streaming
   const onLog = (data: { taskId: string; message: string }) => {
-    if (data.taskId !== currentState?.id) return;
-    tui.appendOutput({ type: 'tool', text: data.message });
+    // Show logs from main agent AND any spawned subagents
+    if (data.taskId === currentState?.id) {
+      tui.appendOutput({ type: 'tool', text: data.message });
+    } else {
+      // Check if it's a subagent of the current session
+      const task = taskRunner.getTask(data.taskId);
+      if (task) {
+        tui.appendOutput({ type: 'tool', text: data.message });
+      }
+    }
   };
   taskRunner.on('task:log', onLog);
+
+  // Show initial thinking indicator
+  tui.appendOutput({ type: 'tool', text: '\x1b[90m🧠 Agent thinking...\x1b[0m' });
 
   try {
     const { result, state } = await runAgent(currentState, trimmed);

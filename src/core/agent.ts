@@ -98,13 +98,21 @@ export async function runAgent(state: AgentState, task: string): Promise<{ resul
 
         const reply = await state.llm.chat(messages, Array.from(state.tools.values()));
 
-        // Emit token usage if available
+        // Emit progress — show iteration, token count, and next action
+        const nextCallName = reply.tool_calls?.[0]?.function.name ?? 'thinking';
+        let progressMsg = `🔄 [${i + 1}/${state.maxIterations}] ${nextCallName}`;
         if (reply.usage) {
-            state.taskRunner?.emit('task:log', {
-                taskId: state.id,
-                message: `📊 ${reply.usage.total_tokens ?? '?'}t (↑${reply.usage.prompt_tokens ?? '?'} ↓${reply.usage.completion_tokens ?? '?'})`,
-            });
+            const pt = reply.usage.prompt_tokens ?? 0;
+            const ct = reply.usage.completion_tokens ?? 0;
+            progressMsg += `  📊 ${(pt / 1000).toFixed(1)}k→${(ct / 1000).toFixed(1)}k tokens`;
         }
+        if (state.name !== 'main') {
+            progressMsg = `[${state.name}] ${progressMsg}`;
+        }
+        state.taskRunner?.emit('task:log', {
+            taskId: state.id,
+            message: progressMsg,
+        });
 
         if (!reply.tool_calls) {
             const finalContent = reply.content ?? '(no response)';

@@ -72,6 +72,10 @@ export class TUI extends EventEmitter {
   private editor: Editor;
   private running = false;
   promptActive = false;
+  /** Resolve callback for the currently-active promptUser call. */
+  private pendingPromptResolve: ((value: string) => void) | null = null;
+  /** Echo line component for the currently-active prompt. */
+  private echoLine: Text | null = null;
 
   constructor() {
     super();
@@ -90,7 +94,19 @@ export class TUI extends EventEmitter {
     // Editor with clean border theme
     this.editor = new Editor(this.tui, editorTheme, { paddingX: 1 });
     this.editor.onSubmit = (text: string) => {
-      if (this.promptActive || this.running) return;
+      // Route to active promptUser if one is waiting
+      if (this.promptActive && this.pendingPromptResolve) {
+        const resolve = this.pendingPromptResolve;
+        this.pendingPromptResolve = null;
+        this.promptActive = false;
+        this.echoLine?.setText(`\x1b[90m  ✓ ${text}\x1b[0m`);
+        this.tui.renderNow();
+        // Re-disable Editor if agent still running
+        this.editor.disableSubmit = this.running;
+        resolve(text);
+        return;
+      }
+      if (this.running) return;
       this.outputVStack.addChild(new Text(`\x1b[36m│ ${text}\x1b[0m`, 0, 0));
       this.scrollView.scrollToEnd();
       this.emit('submit', text);
@@ -183,29 +199,21 @@ export class TUI extends EventEmitter {
     this.editor.disableSubmit = running;
   }
 
-  /** Prompt for a line of text during agent execution. */
+  /** Prompt for a line of text during agent execution.
+   *  Uses the main Editor for input — user types in the Editor area
+   *  and presses Enter to submit. No separate input listener. */
   promptUser(question: string): Promise<string> {
     this.outputVStack.addChild(new Text(`\x1b[33m⏸ ${question}\x1b[0m`));
+    this.echoLine = new Text(`\x1b[36m  > \x1b[0m`, 0, 0);
+    this.outputVStack.addChild(this.echoLine);
+    this.scrollView.scrollToEnd();
     this.tui.renderNow();
     this.promptActive = true;
+    // Enable Editor so user can type response (may be disabled by setRunning)
+    this.editor.disableSubmit = false;
 
     return new Promise(resolve => {
-      let buf = '';
-      const remove = this.tui.addInputListener((data: string) => {
-        if (data === '\r' || data === '\n') {
-          remove(); this.promptActive = false; resolve(buf);
-          return { consume: true };
-        }
-        if ((data === '\x7f' || data === '\b') && buf.length > 0) {
-          buf = buf.slice(0, -1);
-          return { consume: true };
-        }
-        if (data.length === 1 && data.charCodeAt(0) >= 32) {
-          buf += data;
-          return { consume: true };
-        }
-        return { consume: false };
-      });
+      this.pendingPromptResolve = resolve;
     });
   }
 
@@ -221,14 +229,25 @@ export class TUI extends EventEmitter {
         const ch = data.toLowerCase().trim();
         if (ch.startsWith('/')) {
           // Slash command typed during confirm — release prompt lock and pass command to editor
+          this.echoLine = new Text(`\x1b[90m  ↪ Slash command — skipped\x1b[0m`, 0, 0);
+          this.outputVStack.addChild(this.echoLine);
+          this.tui.renderNow();
           remove(); this.promptActive = false; resolve(false);
           return { consume: false };
         }
         if (ch === 'y' || ch === '\r' || ch === '\n' || ch === 'yes') {
+          this.echoLine = new Text(`\x1b[32m  ✓ Approved\x1b[0m`, 0, 0);
+          this.outputVStack.addChild(this.echoLine);
+          this.scrollView.scrollToEnd();
+          this.tui.renderNow();
           remove(); this.promptActive = false; resolve(true);
           return { consume: true };
         }
         if (ch === 'n' || ch === '\x1b' || ch === 'no') {
+          this.echoLine = new Text(`\x1b[31m  ✘ Denied\x1b[0m`, 0, 0);
+          this.outputVStack.addChild(this.echoLine);
+          this.scrollView.scrollToEnd();
+          this.tui.renderNow();
           remove(); this.promptActive = false; resolve(false);
           return { consume: true };
         }

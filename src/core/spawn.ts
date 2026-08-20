@@ -35,6 +35,10 @@ export async function spawnAgent(opts: SpawnAgentOptions): Promise<string> {
     const subStateId = randomUUID();
     const isAsync = Boolean(opts.async && opts.taskRunner);
 
+    // Enrich task with platform context so subagent uses correct commands
+    const platformHint = `\n[Platform: ${process.platform} | Shell commands use cmd /c on Windows, sh -c on Unix]`;
+    const enrichedTask = `${opts.task}${platformHint}`;
+
     const subState = createAgentState({
         id: subStateId,
         name: def.name,
@@ -56,16 +60,22 @@ export async function spawnAgent(opts: SpawnAgentOptions): Promise<string> {
         taskRunner: opts.taskRunner,
     });
 
+    // ── Spawn visibility ──────────────────────────────
+    const spawnMsg = `🤖 Orchestrator delegated to @${def.name}: "${opts.task.slice(0, 80)}"`;
+    if (opts.parentId) {
+      opts.taskRunner?.emit('task:log', { taskId: opts.parentId, message: spawnMsg });
+    }
+
     if (isAsync) {
-        const taskRecord = opts.taskRunner!.submitTask(subState, opts.task);
+        const taskRecord = opts.taskRunner!.submitTask(subState, enrichedTask);
         return `[Agent "${def.name}" spawned in background with Task ID: ${taskRecord.id}]`;
     }
 
     // Register with TaskRunner so waitForInput works for sync agents too
     if (opts.taskRunner) {
-        opts.taskRunner.registerSyncAgent(subState, opts.task);
+        opts.taskRunner.registerSyncAgent(subState, enrichedTask);
     }
 
-    const { result } = await runAgent(subState, opts.task);
+    const { result } = await runAgent(subState, enrichedTask);
     return `--- ${def.name} output ---\n${result}`;
 }

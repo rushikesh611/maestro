@@ -100,7 +100,7 @@ export const waitForInputTool: Tool = {
             // ── Sync / foreground agent — REPL is blocked ─────────────────
             // Use the main REPL's ask() via promptUser — no second readline created
             if (tr.promptUser) {
-                const input = await tr.promptUser('> ');
+                const input = await tr.promptUser(args.question);
                 tr.sendInput?.(ctx.agentId, input);
                 return `User responded: ${input}`;
             }
